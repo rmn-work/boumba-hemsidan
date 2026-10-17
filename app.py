@@ -988,11 +988,39 @@ COMMON_STYLES = """
             --border-color: #e5e5e5;
         }
 
-        /* Mode Clair par défaut : Fond Blanc Pur */
+        /* Mode Clair par défaut : Fond Blanc avec multi-logos répétés Urban Nation */
         body {
             font-family: 'Inter', sans-serif;
             background-color: #ffffff !important;
             color: #111111 !important;
+            position: relative;
+        }
+
+        /* Multiples petits logos répétés en arrière-plan (Pattern / Wallpaper) */
+        body::before {
+            content: "";
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            background-image: url('/static/uploads/image1.jpeg');
+            background-repeat: repeat; /* Répète le logo partout sur la page */
+            background-position: 0 0;
+            background-size: 80px 80px; /* Taille de chaque petit logo */
+            opacity: 0.025; /* Très discret et élégant */
+            pointer-events: none;
+            z-index: -1;
+        }
+
+        /* Mode Sombre (Dark Mode) */
+        body.dark-mode {
+            background-color: #0f0f12 !important;
+            color: #ffffff !important;
+        }
+        body.dark-mode::before {
+            filter: invert(1) brightness(2); /* Inverse les logos en blanc sur fond sombre */
+            opacity: 0.035;
         }
 
         h1, h2, h3, h4, h5, .brand-font {
@@ -1011,7 +1039,6 @@ COMMON_STYLES = """
             transition: transform 0.3s ease;
         }
 
-        /* Cartes en Light Mode (Fond blanc, texte noir) */
         .card {
             background-color: #ffffff !important;
             color: #111111 !important;
@@ -1033,7 +1060,6 @@ COMMON_STYLES = """
             color: #666666 !important;
         }
 
-        /* Badges Bestsellers / Rank (#1, #2...) */
         .badge.bg-dark, 
         body.dark-mode .badge.bg-dark {
             background-color: #0d0d0d !important;
@@ -1041,7 +1067,6 @@ COMMON_STYLES = """
             border: 1px solid #444444 !important;
         }
 
-        /* Badge stock faible toujours rouge */
         .badge.bg-danger, 
         body.dark-mode .badge.bg-danger {
             background-color: #dc3545 !important;
@@ -1069,12 +1094,6 @@ COMMON_STYLES = """
             font-weight: 700 !important;
             color: #111111 !important;
             border-radius: 8px;
-        }
-
-        /* Mode Sombre (Dark Mode) */
-        body.dark-mode {
-            background-color: #0f0f12 !important;
-            color: #ffffff !important;
         }
 
         body.dark-mode h1, body.dark-mode h2, body.dark-mode h3, body.dark-mode h4, body.dark-mode h5 {
@@ -1140,6 +1159,31 @@ HOME_TEMPLATE = """
     <meta charset="UTF-8">
     <title>URBAN NATION - Official E-commerce & Events</title>
     """ + COMMON_STYLES + """
+    <style>
+        /* Effet filigrane / Logo en arrière-plan (Watermark Urban Nation) */
+        .bg-urban-watermark {
+            position: relative;
+            overflow: hidden;
+        }
+        .bg-urban-watermark::before {
+            content: "URBAN NATION";
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%) rotate(-20deg);
+            font-size: 7.5rem;
+            font-weight: 900;
+            color: rgba(255, 255, 255, 0.04); /* Très subtil en Dark Mode */
+            white-space: nowrap;
+            pointer-events: none;
+            z-index: 0;
+            font-family: 'Montserrat', sans-serif;
+            letter-spacing: 4px;
+        }
+        body:not(.dark-mode) .bg-urban-watermark::before {
+            color: rgba(0, 0, 0, 0.04); /* Très subtil en Light Mode */
+        }
+    </style>
 </head>
 <body>
 
@@ -1183,20 +1227,20 @@ HOME_TEMPLATE = """
           {% endif %}
         {% endwith %}
 
-        <!-- Hero Banner avec la photo DJ / platines et texte parfaitement lisible sur fond sombre -->
-        <div class="p-5 mb-5 text-white rounded-4 shadow-lg text-center position-relative overflow-hidden" 
-             style="background: linear-gradient(rgba(0,0,0,0.7), rgba(0,0,0,0.85)), url('{{ hero_bg }}') center/cover no-repeat;">
-            <div class="mb-3">
+        <!-- Hero Banner avec filigrane Urban Nation en arrière-plan -->
+        <div class="p-5 mb-5 text-white rounded-4 shadow-lg text-center position-relative overflow-hidden bg-urban-watermark" 
+             style="background: linear-gradient(rgba(0,0,0,0.75), rgba(0,0,0,0.88)), url('{{ hero_bg }}') center/cover no-repeat;">
+            <div class="mb-3 position-relative" style="z-index: 1;">
                 <img src="{{ logo_url }}" alt="Urban Nation Banner Logo" style="height: 110px; width: 110px; border-radius: 50%; object-fit: cover; border: 3px solid #ffffff;" class="shadow" onerror="this.style.display='none'">
             </div>
-            <h1 class="fw-bold display-4 text-uppercase tracking-wide text-white">URBAN <span style="color: #ffffff;">NATION</span></h1>
-            <p class="lead text-light max-w-700 mx-auto opacity-90">xxx</p>
-            <div class="d-flex justify-content-center gap-3 mt-4">
+            <h1 class="fw-bold display-4 text-uppercase tracking-wide text-white position-relative" style="z-index: 1;">URBAN <span style="color: #ffffff;">NATION</span></h1>
+            <p class="lead text-light max-w-700 mx-auto opacity-90 position-relative" style="z-index: 1;">xxx</p>
+            <div class="d-flex justify-content-center gap-3 mt-4 position-relative" style="z-index: 1;">
                 <a href="#catalog-section" class="btn btn-warning btn-lg px-4 fw-bold">Utforska Shoppen</a>
                 <a href="#events-section" class="btn btn-outline-light btn-lg px-4">Boka Eventbiljetter</a>
             </div>
         </div>
-        
+
         <hr class="my-4">
 
         <div id="events-section" class="pt-3">
@@ -1249,7 +1293,7 @@ HOME_TEMPLATE = """
                 {% endfor %}
             </div>
         </div>
-        
+
         <hr class="my-4">
 
         <div id="top-section" class="pt-3">
@@ -1290,7 +1334,7 @@ HOME_TEMPLATE = """
                 {% endfor %}
             </div>
         </div>
-        
+
         <hr class="my-4">
 
         <div id="catalog-section" class="pt-3">
@@ -1440,7 +1484,7 @@ HOME_TEMPLATE = """
                 </div>
                 <div class="col-md-4 col-lg-3 col-xl-3 mx-auto mt-3">
                     <h5 class="text-uppercase mb-4 font-weight-bold text-white">Kontakt</h5>
-                    <p class="small text-muted mb-1">📍 xxxvägen x, Luleå, Umeå/p>
+                    <p class="small text-muted mb-1">📍 xxxvägen x, Luleå, Umeå</p>
                     <p class="small text-muted mb-1">✉️ xxx@urbannation???.se</p>
                     <p class="small text-muted mb-1">📞 +46 x xxx xxx xx</p>
                 </div>
@@ -1461,8 +1505,7 @@ HOME_TEMPLATE = """
             localStorage.setItem('theme', isDark ? 'dark' : 'light');
             document.getElementById('themeToggleBtn').innerText = isDark ? '☀️ Light' : '🌙 Dark';
         }
-    
-        // Initialisation au chargement de la page (Light mode par défaut)
+
         document.addEventListener('DOMContentLoaded', function() {
             const savedTheme = localStorage.getItem('theme');
             if (savedTheme === 'dark') {
@@ -1475,7 +1518,7 @@ HOME_TEMPLATE = """
                 if (btn) btn.innerText = '🌙 Dark';
             }
         });
-    
+
         function updateCountdowns() {
             const timers = document.querySelectorAll('.countdown-timer');
             timers.forEach(timer => {
@@ -1483,10 +1526,9 @@ HOME_TEMPLATE = """
                 const eventDate = new Date(eventDateStr + "T23:59:59").getTime();
                 const now = new Date().getTime();
                 const distance = eventDate - now;
-        
-                // Force explicitement la couleur blanche avec setProperty
+
                 timer.style.setProperty('color', '#ffffff', 'important');
-        
+
                 if (distance < 0) {
                     timer.innerText = "🎉 Eventet har börjat!";
                 } else {
@@ -1515,9 +1557,9 @@ HOME_TEMPLATE = """
                 if ((catId === 'all' || cat === catId) && name.includes(searchInput)) { item.style.display = ""; } else { item.style.display = "none"; }
             }
         }
-    
+
         function changeProductImage(prodId, newSrc) { document.getElementById('main-img-' + prodId).src = newSrc; }
-    
+
         function filterAllProducts() {
             let input = document.getElementById('searchAllProducts').value.toLowerCase();
             let items = document.getElementsByClassName('product-item');
@@ -1525,7 +1567,7 @@ HOME_TEMPLATE = """
                 if (item.getAttribute('data-name').includes(input)) { item.style.display = ""; } else { item.style.display = "none"; }
             }
         }
-    
+
         function sortAllProducts() {
             let sortVal = document.getElementById('sortAllProducts').value;
             let container = document.getElementById('allProductsContainer');
