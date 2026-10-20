@@ -1,42 +1,54 @@
-from flask import Flask, render_template_string, request, redirect, url_for, flash, session, Response, send_file
+from flask import (Flask, render_template_string, request, redirect, url_for, flash, session, Response,
+                   send_file, jsonify)
 from flask_mail import Mail, Message
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 import os
 import random
 from datetime import datetime, timedelta
 import csv
 import io
 import qrcode
-
-# Importation pour la génération PDF des billets
+import time
+import secrets
+import json
+import base64
+import warnings
 from reportlab.lib.pagesizes import A6
 from reportlab.lib import colors
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
-app.secret_key = "secret_key_suede_ecommerce_admin"
-
-# Configuration Flask-Mail
-app.config['MAIL_SERVER'] = os.environ.get('MAIL_SERVER', 'smtp.gmail.com')
-app.config['MAIL_PORT'] = int(os.environ.get('MAIL_PORT', 587))
-app.config['MAIL_USE_TLS'] = os.environ.get('MAIL_USE_TLS', 'true').lower() in ['true', 'on', '1']
-app.config['MAIL_USERNAME'] = os.environ.get('MAIL_USERNAME', 'support@urbannation.se')
-app.config['MAIL_PASSWORD'] = os.environ.get('MAIL_PASSWORD', 'votre_mot_de_passe')
-app.config['MAIL_DEFAULT_SENDER'] = os.environ.get('MAIL_DEFAULT_SENDER',
-                                                   ('URBAN NATION Stockholm', 'no-reply@urbannation.se'))
+app.config.update(
+    SECRET_KEY=os.environ.get('SECRET_KEY', 'urban-nation-super-secret-key-2026'),
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax',
+    PERMANENT_SESSION_LIFETIME=1800,
+    MAIL_SERVER=os.environ.get('MAIL_SERVER', 'smtp.gmail.com'),
+    MAIL_PORT=int(os.environ.get('MAIL_PORT', 587)),
+    MAIL_USE_TLS=os.environ.get('MAIL_USE_TLS', 'true').lower() in ['true', 'on', '1'],
+    MAIL_USERNAME=os.environ.get('MAIL_USERNAME', 'support@urbannation.se'),
+    MAIL_PASSWORD=os.environ.get('MAIL_PASSWORD', 'votre_mot_de_passe'),
+    MAIL_DEFAULT_SENDER=('URBAN NATION', 'no-reply@urbannation.se')
+)
 
 mail = Mail(app)
 
 UPLOAD_FOLDER = 'static/uploads'
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-
-# URL du logo officiel Urban Nation
 LOGO_URL = "/static/uploads/image1.jpeg"
-# Image Hero Banner avec la photo des platines DJ / concert (provenant de votre capture)
-# HERO_DJ_BG = "https://images.unsplash.com/photo-1516450360452-9312f5e86fc7?auto=format&fit=crop&w=1600&q=80"
 HERO_DJ_BG = "/static/uploads/image2.png"
 
+
+limiter = Limiter(
+    app=app,
+    key_func=get_remote_address,
+    storage_uri="memory://",
+    default_limits=["200 per day", "50 per hour"]
+)
 
 def is_new_product(product_date_str):
     try:
@@ -122,7 +134,7 @@ PRODUCTS = [
 EVENTS = [
     {
         "id": 1,
-        "title": "Urban Nation Techno Rave - Winter Edition",
+        "title": "Urban Nation Afrobeat - Winter Edition",
         "date": "2026-11-14",
         "time": "23:00 - 05:00",
         "location": "xxx, Luleå",
@@ -139,6 +151,18 @@ EVENTS = [
         "price": 200,
         "image": "https://images.unsplash.com/photo-1492684223066-81342ee5ff30?auto=format&fit=crop&w=500&q=60",
         "desc": "Lansering av nya streetwear-kollektionen kombinerat med live hip-hop uppträdanden."
+    },
+    {
+        "id": 1,
+        "title": "URBAN NATION - Dancehall Music",
+        "date": "2026-11-20",
+        "location": "Stockholm Club Central",
+        "min_age": 18,
+        "categories": [
+            {"name": "Standard", "price": 250, "total_stock": 200, "sold": 120},
+            {"name": "VIP Access", "price": 450, "total_stock": 50, "sold": 42},
+            {"name": "Backstage Pass", "price": 750, "total_stock": 15, "sold": 14}
+        ]
     }
 ]
 
@@ -218,6 +242,20 @@ def get_current_user():
     return None
 
 
+@app.route('/login/<provider>')
+def social_login(provider):
+    provider_name = provider.capitalize()
+    flash(f"Inloggning med {provider_name} är under utveckling.", "info")
+    return redirect(url_for('user_login'))
+
+
+@app.route('/logout')
+def user_logout():
+    session.pop('user_email', None)
+    flash("Du har loggats ut.", "info")
+    return redirect(url_for('index'))
+
+
 def generate_pdf_ticket_buffer(order_id, ticket_name, customer_name, customer_email):
     qr_data = f"TICKET-ORD-{order_id}-{ticket_name}"
     qr_img = qrcode.make(qr_data)
@@ -266,6 +304,361 @@ def generate_pdf_ticket_buffer(order_id, ticket_name, customer_name, customer_em
     doc.build(story)
     pdf_buffer.seek(0)
     return pdf_buffer
+
+
+def check_event_age_eligibility(birth_date_str, min_age, event_date_str):
+    birth_date = datetime.strptime(birth_date_str, "%Y-%m-%d")
+    event_date = datetime.strptime(event_date_str, "%Y-%m-%d")
+    eligible_date = datetime(birth_date.year + min_age, birth_date.month, birth_date.day)
+
+    if event_date >= eligible_date:
+        return True, 0
+    else:
+        days_remaining = (eligible_date - event_date).days
+        return False, days_remaining
+
+
+EVENTS = []
+
+
+@app.route('/admin/add_event', methods=['POST'])
+def add_event():
+    if not session.get('admin_logged'):
+        return redirect(url_for('admin_login'))
+
+    global EVENTS
+    title = request.form.get('title')
+    date = request.form.get('date')
+    time = request.form.get('time')
+    location = request.form.get('location')
+    min_age = int(request.form.get('min_age', 18))
+    desc = request.form.get('desc', '')
+    base_price = float(request.form.get('price', 250))
+    announcement_active = 'announcement_active' in request.form
+    announcement_text = request.form.get('announcement_text', '')
+    announcement_image_path = None
+    announcement_file = request.files.get('announcement_file')
+    if announcement_file and announcement_file.filename != '':
+        filename = f"announce_{random.randint(1000, 9999)}_{announcement_file.filename}"
+        filepath = os.path.join(app.config.get('UPLOAD_FOLDER', 'static/uploads'), filename)
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        announcement_file.save(filepath)
+        announcement_image_path = f"/{filepath}"
+
+    image_url = request.form.get('image_url')
+    file = request.files.get('image_file')
+
+    if file and file.filename != '':
+        filename = f"event_{random.randint(1000, 9999)}_{file.filename}"
+        filepath = os.path.join(app.config.get('UPLOAD_FOLDER', 'static/uploads'), filename)
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        file.save(filepath)
+        image_path = f"/{filepath}"
+    elif image_url:
+        image_path = image_url
+    else:
+        image_path = "/static/uploads/image1.jpeg"
+
+    checked_types = request.form.getlist('ticket_types')
+    custom_categories = []
+
+    if 'Early Bird' in checked_types:
+        custom_categories.append({
+            "name": "Early Bird",
+            "price": int(request.form.get('price_early_bird', 200)),
+            "total_stock": int(request.form.get('stock_early_bird', 50)),
+            "sold": 0
+        })
+
+    if 'Standard' in checked_types:
+        custom_categories.append({
+            "name": "Standard",
+            "price": int(request.form.get('price_standard', base_price)),
+            "total_stock": int(request.form.get('stock_standard', 150)),
+            "sold": 0
+        })
+
+    if 'VIP / Fast Track' in checked_types:
+        custom_categories.append({
+            "name": "VIP / Fast Track",
+            "price": int(request.form.get('price_vip', 375)),
+            "total_stock": int(request.form.get('stock_vip', 40)),
+            "sold": 0
+        })
+
+    if not custom_categories:
+        custom_categories = [{"name": "Standard", "price": int(base_price), "total_stock": 100, "sold": 0}]
+
+    total_tickets_sum = sum(cat['total_stock'] for cat in custom_categories)
+    new_id = max([e['id'] for e in EVENTS], default=0) + 1
+
+    new_event = {
+        "id": new_id,
+        "title": title,
+        "date": date,
+        "time": time,
+        "location": location,
+        "price": base_price,
+        "min_age": min_age,
+        "desc": desc,
+        "total_tickets": total_tickets_sum,
+        "categories": custom_categories,
+        "image": image_path,
+        "announcement_active": announcement_active,
+        "announcement_text": announcement_text,
+        "announcement_image": announcement_image_path
+    }
+
+    EVENTS.append(new_event)
+    flash("Evenemang och meddelande har publicerats!", "success")
+    return redirect(url_for('admin_dashboard') + '#events')
+
+
+@app.route('/admin/edit_event/<int:event_id>', methods=['POST'])
+def edit_event(event_id):
+    if not session.get('admin_logged'):
+        return redirect(url_for('admin_login'))
+
+    global EVENTS
+    event = next((e for e in EVENTS if e['id'] == event_id), None)
+    if event:
+        event['title'] = request.form.get('title')
+        event['date'] = request.form.get('date')
+        event['time'] = request.form.get('time')
+        event['location'] = request.form.get('location')
+        event['min_age'] = int(request.form.get('min_age', 18))
+        event['desc'] = request.form.get('desc', '')
+        flash("Evenemanget har uppdaterats!", "success")
+    else:
+        flash("Kunde inte hitta evenemanget.", "danger")
+
+    return redirect(url_for('admin_dashboard') + '#events')
+
+
+@app.route('/admin/delete_event/<int:event_id>')
+def delete_event(event_id):
+    if not session.get('admin_logged'):
+        return redirect(url_for('admin_login'))
+
+    global EVENTS
+    initial_len = len(EVENTS)
+    EVENTS = [e for e in EVENTS if e['id'] != event_id]
+
+    if len(EVENTS) < initial_len:
+        flash("Evenemanget har tagits bort.", "success")
+    else:
+        flash("Kunde inte hitta evenemanget.", "danger")
+
+    return redirect(url_for('admin_dashboard') + '#events')
+
+
+# --- STOCKAGE GLOBAL POUR L'ANNONCE ---
+global_announcement = {"active": False, "text": "", "image": None}
+
+
+@app.route('/admin/update_announcement', methods=['POST'])
+def update_announcement():
+    if not session.get('admin_logged'):
+        return redirect(url_for('admin_login'))
+
+    global global_announcement
+    is_active = 'announcement_active' in request.form
+    text = request.form.get('announcement_text', '')
+    image_path = global_announcement.get('image')
+    file = request.files.get('announcement_file')
+
+    if file and file.filename != '':
+        filename = f"announce_{random.randint(1000, 9999)}_{file.filename}"
+        filepath = os.path.join(app.config.get('UPLOAD_FOLDER', 'static/uploads'), filename)
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        file.save(filepath)
+        image_path = f"/{filepath}"
+
+    global_announcement = {
+        "active": is_active,
+        "text": text,
+        "image": image_path
+    }
+
+    flash("Meddelandet har uppdaterats!", "success")
+    return redirect(url_for('admin_dashboard') + '#events')
+
+
+@app.route('/admin/delete_announcement')
+def delete_announcement():
+    if not session.get('admin_logged'):
+        return redirect(url_for('admin_login'))
+
+    global global_announcement
+    global_announcement = {"active": False, "text": "", "image": None}
+
+    flash("Meddelandet har raderats.", "info")
+    return redirect(url_for('admin_dashboard') + '#events')
+
+
+SCANNER_TOKENS = {}
+
+
+@app.route('/admin/generate_scanner_link', methods=['POST'])
+def generate_scanner_link():
+    if not session.get('admin_logged'): return redirect(url_for('admin_login'))
+    token = secrets.token_hex(6)
+    password = f"{random.randint(100, 999)}-{random.randint(100, 999)}"
+    expires_at = time.time() + (6 * 3600)
+    expires_formatted = datetime.fromtimestamp(expires_at).strftime("%Y-%m-%d %H:%M")
+
+    SCANNER_TOKENS[token] = {
+        "password": password,
+        "expires_at": expires_at,
+        "expires_formatted": expires_formatted
+    }
+    log_admin_action("Scanner-länk skapad",
+                     f"En tillfällig scanner-länk (Token: {token}) skapades med 6 timmars giltighet.")
+    flash("Ny tidsbegränsad scanner-länk har genererats!", "success")
+    return redirect(url_for('admin_dashboard') + '#scanner-section')
+
+
+@app.route('/scanner/<token>', methods=['GET', 'POST'])
+def agent_scanner_page(token):
+    token_data = SCANNER_TOKENS.get(token)
+
+    if not token_data:
+        return "<h3>❌ Ogiltig eller borttagen scanner-länk.</h3>", 404
+
+    if time.time() > token_data["expires_at"]:
+        return "<h3>⏰ Denna scanner-länk har gått ut (giltig i max 6 timmar). Begär en ny länk från administratören.</h3>", 403
+
+    session_key = f"scanner_auth_{token}"
+
+    if request.method == 'POST':
+        input_password = request.form.get('password', '').strip()
+        if input_password == token_data['password']:
+            session[session_key] = True
+            flash("Inloggad i skannern!", "success")
+            return redirect(url_for('agent_scanner_page', token=token))
+        else:
+            flash("Felaktigt lösenord för skannern.", "danger")
+
+    if not session.get(session_key):
+        return render_template_string(SCANNER_LOGIN_TEMPLATE, token=token, expires=token_data['expires_formatted'])
+
+    return render_template_string(SCANNER_AGENT_TEMPLATE, token=token, expires=token_data['expires_formatted'])
+
+
+TICKET_SCANS = []
+
+@app.route('/api/scan_ticket', methods=['POST'])
+def api_scan_ticket():
+    data = request.get_json()
+    ticket_code = data.get('ticket_code', '').strip()
+
+    if not ticket_code:
+        return jsonify({"status": "INVALID", "message": "Ogiltig QR-kod."})
+
+    already_scanned = next((s for s in TICKET_SCANS if s['ticket_code'] == ticket_code), None)
+    if already_scanned:
+        return jsonify({
+            "status": "ALREADY_USED",
+            "message": f"Biljetten har redan skannats klockan {already_scanned['timestamp']}!"
+        })
+
+    now = datetime.now()
+    scan_entry = {
+        "ticket_code": ticket_code,
+        "guest_name": "Verifierad Gäst",
+        "category": "VIP / Standard",
+        "min_age": 18,
+        "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "hour": now.hour
+    }
+    TICKET_SCANS.insert(0, scan_entry)
+
+    return jsonify({
+        "status": "VALID",
+        "category": scan_entry["category"],
+        "guest_name": scan_entry["guest_name"],
+        "min_age": scan_entry["min_age"],
+        "message": "Biljetten är godkänd."
+    })
+
+
+@app.route('/admin/issue_vip_ticket', methods=['POST'])
+def issue_vip_ticket():
+    if not session.get('admin_logged'):
+        return redirect(url_for('admin_login'))
+
+    guest_email = request.form.get('guest_email', '').strip().lower()
+    guest_name = request.form.get('guest_name', '').strip()
+    event_name = request.form.get('event_name', '').strip()
+    ticket_category = request.form.get('ticket_category', 'VIP Guest')
+
+    if not guest_email or not guest_name:
+        flash("E-post och namn krävs för att utfärda VIP-biljett.", "danger")
+        return redirect(url_for('admin_dashboard'))
+
+    order_id = random.randint(10000, 99999)
+    ticket_code = f"VIP-{order_id}-{random.randint(1000, 9999)}"
+
+    new_vip_order = {
+        "id": order_id,
+        "customer_email": guest_email,
+        "customer_name": guest_name,
+        "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "order_items": [{
+            "id": 999,
+            "name": f"{event_name} ({ticket_category})",
+            "price": 0,
+            "quantity": 1,
+            "type": "ticket",
+            "ticket_code": ticket_code
+        }],
+        "total": 0,
+        "shipping": "Digital Leverans",
+        "status": "Godkänd (VIP Inbjudan)"
+    }
+    ORDERS.insert(0, new_vip_order)
+    send_vip_invitation_email(guest_email, guest_name, event_name)
+    log_admin_action("VIP Biljett Utfärdad", f"VIP-biljett skickad till {guest_name} ({guest_email}) för {event_name}.")
+    flash(f"VIP-biljett har lagts till i kontot för {guest_email} och en inbjudan har skickats!", "success")
+    return redirect(url_for('admin_dashboard') + '#vip-section')
+
+
+@app.route('/api/get_checkin_stats')
+def get_checkin_stats():
+    selected_event = request.args.get('event', 'ALL')
+
+    if selected_event == 'ALL':
+        filtered_scans = TICKET_SCANS
+        total_tickets = sum(int(e.get('total_tickets', 100)) for e in events) if 'events' in globals() and events else 100
+    else:
+        filtered_scans = [s for s in TICKET_SCANS if s.get('category') == selected_event]
+        matching_event = next((e for e in events if e.get('title') == selected_event), None) if 'events' in globals() else None
+        total_tickets = int(matching_event.get('total_tickets', 100)) if matching_event else 100
+
+    checked_in = len(filtered_scans)
+    percent = round((checked_in / total_tickets * 100), 1) if total_tickets > 0 else 0
+    hours_map = [15, 16, 17, 18, 19, 20, 21, 22, 23, 0, 1, 2, 3, 4, 5, 6, 7]
+    hourly_counts = [0] * len(hours_map)
+
+    for scan in filtered_scans:
+        scan_hour = scan.get('hour')
+        if scan_hour in hours_map:
+            idx = hours_map.index(scan_hour)
+            hourly_counts[idx] += 1
+
+    return jsonify({
+        'checked_in': checked_in,
+        'total_tickets': total_tickets,
+        'percent': percent,
+        'hourly_counts': hourly_counts,
+        'history': filtered_scans
+    })
+
+
+def send_vip_invitation_email(email, name, event_name):
+    subject = f"🎉 Du har fått en VIP-inbjudan till {event_name} - URBAN NATION"
+
+    print(f"[EMAIL VIP] Skickat till {email}: Hej {name}, din VIP-biljett finns nu tillgänglig i ditt konto på URBAN NATION under 'Mina Biljetter'. Logga in för att hämta den och utforska vår nya kollektion!")
 
 
 def send_order_confirmation_email(order):
@@ -339,8 +732,6 @@ def send_order_confirmation_email(order):
         return False
 
 
-# --- EXPORTATION CSV ---
-
 @app.route('/admin/export/orders')
 def export_orders_csv():
     if not session.get('admin_logged'): return redirect(url_for('admin_login'))
@@ -388,7 +779,125 @@ def export_event_attendees_csv():
     return response
 
 
-# --- ROUTES GESTION ---
+@app.route('/admin/export_sales_csv')
+def export_sales_csv():
+    if not session.get('admin_logged'):
+        return redirect(url_for('admin_login'))
+
+    filter_month = request.args.get('month', '')
+    filter_year = request.args.get('year', '')
+
+    output = io.StringIO()
+    writer = csv.writer(output, delimiter=';')
+
+    writer.writerow([
+        'Order ID', 'Datum', 'Kund Namn', 'E-post', 'Produkt/Biljett',
+        'Kategori/Typ', 'Antal', 'Pris Inkl. Moms (SEK)', 'Moms %',
+        'Moms Belopp (SEK)', 'Belopp Exkl. Moms (SEK)', 'Betalningsstatus'
+    ])
+
+    for order in ORDERS:
+        order_date_str = order.get('date', '')
+
+        if filter_year and not order_date_str.startswith(filter_year):
+            continue
+        if filter_month:
+            expected_month_str = f"-{filter_month}-"
+            if expected_month_str not in order_date_str:
+                continue
+
+        for item in order.get('order_items', []):
+            item_type = item.get('type', 'clothing')
+            vat_rate = 6 if item_type == 'ticket' else 25
+
+            price_incl = item.get('price', 0)
+            qty = item.get('quantity', 1)
+            total_incl = price_incl * qty
+
+            total_excl = round(total_incl / (1 + (vat_rate / 100)), 2)
+            vat_amount = round(total_incl - total_excl, 2)
+
+            writer.writerow([
+                order.get('id'),
+                order_date_str,
+                order.get('customer_name', 'Gäst'),
+                order.get('customer_email', ''),
+                item.get('name'),
+                'Biljett (6% moms)' if item_type == 'ticket' else 'Kläder/Merch (25% moms)',
+                qty,
+                total_incl,
+                f"{vat_rate}%",
+                vat_amount,
+                total_excl,
+                order.get('status', 'Godkänd')
+            ])
+
+    output.seek(0)
+    filename = f"URBAN_NATION_Moms_Rapport_{filter_year or 'Alla'}_{filter_month or 'Alla'}.csv"
+    return Response(
+        output.getvalue(),
+        mimetype="text/csv; charset=utf-8-sig",
+        headers={"Content-Disposition": f"attachment;filename={filename}"}
+    )
+
+
+@app.route('/admin/sales_report_pdf')
+def sales_report_pdf():
+    if not session.get('admin_logged'):
+        return redirect(url_for('admin_login'))
+
+    total_clothing_incl = 0
+    total_clothing_vat = 0
+    total_ticket_incl = 0
+    total_ticket_vat = 0
+
+    detailed_items = []
+
+    for order in ORDERS:
+        for item in order.get('order_items', []):
+            item_type = item.get('type', 'clothing')
+            qty = item.get('quantity', 1)
+            total_incl = item.get('price', 0) * qty
+
+            if item_type == 'ticket':
+                vat_rate = 6
+                total_excl = round(total_incl / 1.06, 2)
+                vat_amt = round(total_incl - total_excl, 2)
+                total_ticket_incl += total_incl
+                total_ticket_vat += vat_amt
+            else:
+                vat_rate = 25
+                total_excl = round(total_incl / 1.25, 2)
+                vat_amt = round(total_incl - total_excl, 2)
+                total_clothing_incl += total_incl
+                total_clothing_vat += vat_amt
+
+            detailed_items.append({
+                "order_id": order.get('id'),
+                "date": order.get('date'),
+                "customer": order.get('customer_name'),
+                "item_name": item.get('name'),
+                "type_label": "Biljett (6%)" if item_type == 'ticket' else "Kläder/Merch (25%)",
+                "vat_rate": vat_rate,
+                "total_incl": total_incl,
+                "vat_amt": vat_amt,
+                "total_excl": total_excl
+            })
+
+    total_grand_incl = total_clothing_incl + total_ticket_incl
+    total_grand_vat = total_clothing_vat + total_ticket_vat
+
+    return render_template_string(
+        SALES_REPORT_PDF_TEMPLATE,
+        items=detailed_items,
+        total_clothing_incl=total_clothing_incl,
+        total_clothing_vat=total_clothing_vat,
+        total_ticket_incl=total_ticket_incl,
+        total_ticket_vat=total_ticket_vat,
+        total_grand_incl=total_grand_incl,
+        total_grand_vat=total_grand_vat,
+        now_date=datetime.now().strftime("%Y-%m-%d %H:%M")
+    )
 
 @app.route('/admin/add_type', methods=['POST'])
 def admin_add_type():
@@ -504,9 +1013,19 @@ def index():
     cart_count = len(cart.split(',')) if cart else 0
     current_user = get_current_user()
     top_products = sorted(PRODUCTS, key=lambda x: x['sold'], reverse=True)[:10]
-    return render_template_string(HOME_TEMPLATE, products=PRODUCTS, top_products=top_products, events=EVENTS,
-                                  product_types=PRODUCT_TYPES, cart_count=cart_count, current_user=current_user,
-                                  logo_url=LOGO_URL, hero_bg=HERO_DJ_BG)
+
+    return render_template_string(
+        HOME_TEMPLATE,
+        products=PRODUCTS,
+        top_products=top_products,
+        events=EVENTS,
+        product_types=PRODUCT_TYPES,
+        cart_count=cart_count,
+        current_user=current_user,
+        logo_url=LOGO_URL,
+        hero_bg=HERO_DJ_BG,
+        global_announcement=global_announcement
+    )
 
 
 @app.route('/add/<int:product_id>', methods=['POST', 'GET'])
@@ -532,18 +1051,28 @@ def add_to_cart(product_id):
 
 
 @app.route('/login', methods=['GET', 'POST'])
+@limiter.limit("10 per minute")
 def user_login():
     if request.method == 'POST':
         email = request.form.get('email', '').strip().lower()
         password = request.form.get('password')
-        customer = next((c for c in CUSTOMERS if c['email'].lower() == email and c['password'] == password), None)
+        customer = next((c for c in CUSTOMERS if c['email'].lower() == email), None)
+
         if customer:
-            session['user_email'] = customer['email']
-            flash(f"Välkommen tillbaka, {customer['name']}!", "success")
-            return redirect(url_for('user_account'))
-        else:
-            flash("Felaktig e-postadress eller lösenord.", "danger")
+            stored_pwd = customer.get('password', '')
+            is_valid = check_password_hash(stored_pwd, password) if stored_pwd.startswith('pbkdf2:') else (stored_pwd == password)
+
+            if is_valid:
+                session['user_email'] = customer['email']
+                flash(f"Välkommen tillbaka, {customer['name']}!", "success")
+                return redirect(url_for('user_account'))
+
+        flash("Felaktig e-postadress eller lösenord.", "danger")
+
     return render_template_string(USER_LOGIN_TEMPLATE, logo_url=LOGO_URL)
+
+
+ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'suisse2026')
 
 
 @app.route('/register', methods=['GET', 'POST'])
@@ -554,26 +1083,39 @@ def user_register():
         email = request.form.get('email', '').strip().lower()
         password = request.form.get('password')
         confirm_password = request.form.get('confirm_password')
-        phone = request.form.get('phone')
-        address = request.form.get('address')
-        postal_code = request.form.get('postal_code')
-        city = request.form.get('city')
+        phone = request.form.get('phone', '').strip()
+        address = request.form.get('address', '').strip()
+        postal_code = request.form.get('postal_code', '').strip()
+        city = request.form.get('city', '').strip()
 
-        if password != confirm_password:
+        if not password or len(password) < 6:
+            flash("Lösenordet måste vara minst 6 tecken långt.", "danger")
+        elif password != confirm_password:
             flash("Lösenorden matchar inte.", "danger")
         elif any(c['email'].lower() == email for c in CUSTOMERS):
             flash("Det finns redan ett konto registrerat med denna e-postadress.", "warning")
         else:
             full_name = f"{first_name} {last_name}".strip()
             new_id = max([c['id'] for c in CUSTOMERS]) + 1 if CUSTOMERS else 1
+            hashed_password = generate_password_hash(password, method='pbkdf2:sha256', salt_length=16)
             CUSTOMERS.append({
-                "id": new_id, "name": full_name, "first_name": first_name, "last_name": last_name,
-                "email": email, "phone": phone, "address": address, "postal_code": postal_code,
-                "city": city, "password": password, "total_orders": 0
+                "id": new_id,
+                "name": full_name,
+                "first_name": first_name,
+                "last_name": last_name,
+                "email": email,
+                "phone": phone,
+                "address": address,
+                "postal_code": postal_code,
+                "city": city,
+                "password": hashed_password,
+                "total_orders": 0
             })
+
             session['user_email'] = email
             flash("Ditt konto har skapats! Välkommen till URBAN NATION.", "success")
             return redirect(url_for('user_account'))
+
     return render_template_string(USER_REGISTER_TEMPLATE, logo_url=LOGO_URL)
 
 
@@ -598,41 +1140,72 @@ def user_account():
                                   returns=user_returns, logo_url=LOGO_URL)
 
 
-@app.route('/logout')
-def user_logout():
-    session.pop('user_email', None)
-    flash("Du har loggats ut.", "info")
-    return redirect(url_for('index'))
-
-
 @app.route('/admin/login', methods=['GET', 'POST'])
+@limiter.limit("2 per 5 minutes")
 def admin_login():
     if request.method == 'POST':
-        if request.form.get('password') == "suisse2026":
+        input_password = request.form.get('password', '')
+
+        if input_password == ADMIN_PASSWORD:
+            session.clear()
             session['admin_logged'] = True
-            log_admin_action("Inloggning i adminpanelen", "Admin anslöt till systemet.")
+            log_admin_action("Inloggning i adminpanelen", f"Admin anslöt framgångsrikt från IP: {request.remote_addr}.")
             return redirect(url_for('admin_dashboard'))
         else:
+            log_admin_action("MISSLYCKAD INLOGGNING", f"Felaktigt adminlösenord från IP: {request.remote_addr}.")
             flash("Fel lösenord.", "danger")
+
     return render_template_string(ADMIN_LOGIN_TEMPLATE, logo_url=LOGO_URL)
 
 
 @app.route('/admin', methods=['GET', 'POST'])
 def admin_dashboard():
-    if not session.get('admin_logged'): return redirect(url_for('admin_login'))
+    if not session.get('admin_logged'):
+        return redirect(url_for('admin_login'))
+
     total_revenue = sum(p['sold'] * (p['discount_price'] if p.get('discount_price') else p['price']) for p in PRODUCTS)
     total_items_sold = sum(p['sold'] for p in PRODUCTS)
     total_tickets_sold = sum(p['sold'] for p in PRODUCTS if p['type'] == 'ticket')
     ticket_revenue = sum(
         p['sold'] * (p['discount_price'] if p.get('discount_price') else p['price']) for p in PRODUCTS if
         p['type'] == 'ticket')
+    pending_transfers = getattr(app, 'PENDING_TRANSFERS', [])
+
     return render_template_string(ADMIN_DASHBOARD_TEMPLATE,
                                   products=PRODUCTS, events=EVENTS, product_types=PRODUCT_TYPES,
                                   customers=CUSTOMERS, logs=ADMIN_LOGS, orders=ORDERS, returns=RETURNS,
                                   promo_codes=PROMO_CODES,
+                                  scanner_tokens=SCANNER_TOKENS,
+                                  ticket_scans=TICKET_SCANS,
+                                  pending_transfers=pending_transfers,  # 👈 AJOUTÉ ICI
                                   total_revenue=total_revenue, total_items_sold=total_items_sold,
                                   total_tickets_sold=total_tickets_sold, ticket_revenue=ticket_revenue,
                                   logo_url=LOGO_URL)
+
+
+@app.route('/admin/customer/update/<int:customer_id>', methods=['POST'])
+def admin_update_customer(customer_id):
+    if not session.get('admin_logged'):
+        return redirect(url_for('admin_login'))
+
+    cust = next((c for c in CUSTOMERS if c['id'] == customer_id), None)
+    if cust:
+        old_email = cust['email']
+        cust['first_name'] = request.form.get('first_name', cust.get('first_name', ''))
+        cust['last_name'] = request.form.get('last_name', cust.get('last_name', ''))
+        cust['name'] = f"{cust['first_name']} {cust['last_name']}".strip()
+        cust['email'] = request.form.get('email', cust['email']).strip().lower()
+        cust['phone'] = request.form.get('phone', cust.get('phone', ''))
+        cust['address'] = request.form.get('address', cust.get('address', ''))
+        cust['postal_code'] = request.form.get('postal_code', cust.get('postal_code', ''))
+        cust['city'] = request.form.get('city', cust.get('city', ''))
+        log_admin_action(
+            "Kunduppgifter uppdaterade",
+            f"Kund #{customer_id} ({old_email}) uppdaterades av admin."
+        )
+        flash(f"Kunduppgifter för #{customer_id} har uppdaterats!", "success")
+
+    return redirect(url_for('admin_dashboard') + '#customers-section')
 
 
 @app.route('/admin/add_promo', methods=['POST'])
@@ -673,57 +1246,6 @@ def admin_clear_promo_badge(product_id):
         prod['discount_price'] = None
         flash(f"Kampanjbrickan och reapriset för '{prod['name']}' har tagits bort!", "info")
     return redirect(url_for('admin_dashboard') + '#promos')
-
-
-@app.route('/admin/add_event', methods=['POST'])
-def admin_add_event():
-    if not session.get('admin_logged'): return redirect(url_for('admin_login'))
-    title = request.form.get('title')
-    date = request.form.get('date')
-    time = request.form.get('time')
-    location = request.form.get('location')
-    price = int(request.form.get('price'))
-    desc = request.form.get('desc')
-    image_url = request.form.get('image_url')
-    file = request.files.get('image_file')
-
-    if file and file.filename != '':
-        filename = f"event_{random.randint(1000, 9999)}_{file.filename}"
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.save(filepath)
-        image_path = f"/{filepath}"
-    elif image_url:
-        image_path = image_url
-    else:
-        image_path = "https://images.unsplash.com/photo-1516450360452-9312f5e86fc7?auto=format&fit=crop&w=500&q=60"
-
-    new_id = max([e['id'] for e in EVENTS]) + 1 if EVENTS else 1
-    EVENTS.append({"id": new_id, "title": title, "date": date, "time": time, "location": location, "price": price,
-                   "image": image_path, "desc": desc})
-
-    prod_id = max([p['id'] for p in PRODUCTS]) + 1 if PRODUCTS else 1
-    PRODUCTS.append({
-        "id": prod_id, "type": "ticket", "name": f"{title} - Biljett", "price": price,
-        "discount_price": None, "promo_badge": "", "total_stock": 100, "sold": 0,
-        "date": datetime.now().strftime("%Y-%m-%d"), "sizes": [], "colors": [], "image": image_path,
-        "images": [image_path],
-        "desc": f"Biljett till {title} på {location} ({date})."
-    })
-    log_admin_action("Event publicerat", f"Event '{title}' publicerades med tillhörande biljetter.")
-    flash("Eventet har publicerats och biljetter har lagts till i shoppen!", "success")
-    return redirect(url_for('admin_dashboard') + '#events')
-
-
-@app.route('/admin/delete_event/<int:event_id>')
-def admin_delete_event(event_id):
-    if not session.get('admin_logged'): return redirect(url_for('admin_login'))
-    global EVENTS
-    ev = next((e for e in EVENTS if e['id'] == event_id), None)
-    t_title = ev['title'] if ev else f"ID {event_id}"
-    EVENTS = [e for e in EVENTS if e['id'] != event_id]
-    log_admin_action("Event borttaget", f"Event '{t_title}' raderades.")
-    flash("Eventet har tagits bort.", "info")
-    return redirect(url_for('admin_dashboard') + '#events')
 
 
 @app.route('/admin/update_stats', methods=['POST'])
@@ -806,7 +1328,6 @@ def checkout():
     raw_cart_list = [entry for entry in cart.split(',') if entry]
     subtotal = 0
 
-    # Indexation et groupement par produit
     for idx, entry in enumerate(raw_cart_list):
         parts = entry.split(':')
         pid = int(parts[0]) if parts[0].isdigit() else 0
@@ -883,6 +1404,7 @@ def checkout():
         city = request.form.get('city')
         shipping_id = request.form.get('shipping')
         payment_id = request.form.get('payment')
+        birth_date_str = request.form.get('birth_date', '')
 
         if email != confirm_email:
             flash("E-postadresserna matchar inte.", "danger")
@@ -891,6 +1413,28 @@ def checkout():
         if not current_user and password != confirm_password:
             flash("Lösenorden matchar inte.", "danger")
             return redirect(url_for('checkout'))
+
+        has_tickets = any(item['type'] == 'ticket' for item in cart_items)
+        if has_tickets:
+            if not birth_date_str:
+                flash("Födelsedatum krävs för att köpa eventbiljetter.", "danger")
+                return redirect(url_for('checkout'))
+
+            min_required_age = 18
+            event_date_str = datetime.now().strftime("%Y-%m-%d")
+            for item in cart_items:
+                if item['type'] == 'ticket':
+                    match_ev = next((e for e in EVENTS if e['title'].lower() in item['name'].lower()), None)
+                    if match_ev:
+                        min_required_age = match_ev.get('min_age', 18)
+                        event_date_str = match_ev.get('date', datetime.now().strftime("%Y-%m-%d"))
+
+            is_eligible, days_left = check_event_age_eligibility(birth_date_str, min_required_age, event_date_str)
+            if not is_eligible:
+                flash(
+                    f"Köp blockerat: Du uppfyller inte åldersgränsen ({min_required_age} år) för detta event. Det är {days_left} dagar kvar tills du når åldersgränsen.",
+                    "danger")
+                return redirect(url_for('checkout'))
 
         existing_customer = next((c for c in CUSTOMERS if c['email'].lower() == email), None)
         if existing_customer:
@@ -911,7 +1455,6 @@ def checkout():
         total = discounted_subtotal + selected_shipping['price']
         order_id = random.randint(10000, 99999)
 
-        # Mettre à jour les ventes par unité
         for item in cart_items:
             target_p = next((p for p in PRODUCTS if p['id'] == item['id']), None)
             if target_p: target_p['sold'] += item['quantity']
@@ -919,8 +1462,10 @@ def checkout():
         new_order = {
             "id": order_id, "customer_email": email, "customer_name": name,
             "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "order_items": [{"id": i['id'], "name": i['name'], "price": i['price'], "quantity": i['quantity'], "type": i['type']} for i in
-                            cart_items],
+            "order_items": [
+                {"id": i['id'], "name": i['name'], "price": i['price'], "quantity": i['quantity'], "type": i['type']}
+                for i in
+                cart_items],
             "total": total, "shipping": selected_shipping['name'],
             "tracking_number": f"SE{random.randint(10000000, 99999999)}PN",
             "status": "Under behandling"
@@ -945,6 +1490,14 @@ def checkout():
                                   vat_amount=vat_amount, shipping_options=SHIPPING_OPTIONS,
                                   payment_methods=PAYMENT_METHODS, current_user=current_user,
                                   logo_url=LOGO_URL)
+
+
+@app.route('/order/success/<int:order_id>')
+def order_success(order_id):
+    order = next((o for o in ORDERS if o['id'] == order_id), None)
+    if not order:
+        return redirect(url_for('index'))
+    return render_template_string(ORDER_SUCCESS_TEMPLATE, order=order, logo_url=LOGO_URL)
 
 
 @app.route('/cart/increase/<int:index>')
@@ -977,6 +1530,205 @@ def cart_clear():
     resp.set_cookie('cart', '', expires=0) # Tömmer hela varukorgen
     return resp
 
+
+@app.route('/download_apple_wallet/<int:order_id>/<path:item_name>')
+def download_apple_wallet(order_id, item_name):
+    if not session.get('user'):
+        return redirect(url_for('login'))
+
+    user = session['user']
+    ticket_code = f"TICKET-{order_id}-{item_name}"
+    pass_data = {
+        "formatVersion": 1,
+        "passTypeIdentifier": "pass.com.urbannation.tickets",
+        "serialNumber": f"UN-{order_id}",
+        "teamIdentifier": "URBANNATION123",
+        "webServiceURL": "https://urbannation.se/api/passes/",
+        "authenticationToken": "vx7wge41893122",
+        "organizationName": "URBAN NATION",
+        "description": "Entrébiljett till URBAN NATION Event",
+        "logoText": "URBAN NATION",
+        "foregroundColor": "rgb(255, 255, 255)",
+        "backgroundColor": "rgb(15, 15, 15)",
+        "eventTicket": {
+            "primaryFields": [
+                {
+                    "key": "event",
+                    "label": "EVENEMANG",
+                    "value": item_name
+                }
+            ],
+            "secondaryFields": [
+                {
+                    "key": "passenger",
+                    "label": "GÄST",
+                    "value": user.get('name', 'Gäst')
+                }
+            ],
+            "auxiliaryFields": [
+                {
+                    "key": "order",
+                    "label": "ORDER ID",
+                    "value": f"#{order_id}"
+                }
+            ]
+        },
+        "barcode": {
+            "format": "PKBarcodeFormatQR",
+            "message": ticket_code,
+            "messageEncoding": "iso-8859-1"
+        }
+    }
+
+    json_bytes = json.dumps(pass_data, indent=2).encode('utf-8')
+    buffer = io.BytesIO(json_bytes)
+    buffer.seek(0)
+
+    filename = f"URBAN_NATION_AppleWallet_{order_id}.pkpass"
+    return Response(
+        buffer.getvalue(),
+        mimetype="application/vnd.apple.pkpass",
+        headers={"Content-Disposition": f"attachment;filename={filename}"}
+    )
+
+
+@app.route('/add_google_wallet/<int:order_id>/<path:item_name>')
+def add_google_wallet(order_id, item_name):
+    if not session.get('user'):
+        return redirect(url_for('login'))
+
+    user = session['user']
+    ticket_code = f"TICKET-{order_id}-{item_name}"
+    google_pass_payload = {
+        "iss": "urbannation-wallet@developer.gserviceaccount.com",
+        "aud": "google",
+        "typ": "savetowallet",
+        "payload": {
+            "eventTicketObjects": [
+                {
+                    "id": f"3388000000022119933.UN_TICKET_{order_id}",
+                    "classId": "3388000000022119933.URBAN_NATION_EVENT",
+                    "state": "ACTIVE",
+                    "ticketHolderName": user.get('name', 'Gäst'),
+                    "ticketNumber": ticket_code,
+                    "barcode": {
+                        "type": "QR_CODE",
+                        "value": ticket_code
+                    }
+                }
+            ]
+        }
+    }
+
+    encoded_payload = base64.b64encode(json.dumps(google_pass_payload).encode('utf-8')).decode('utf-8')
+    google_wallet_url = f"https://pay.google.com/gp/v/save/{encoded_payload}"
+    return redirect(google_wallet_url)
+
+
+@app.route('/transfer_ticket/<int:order_id>/<path:item_name>', methods=['POST'])
+def transfer_ticket(order_id, item_name):
+    if not session.get('user'):
+        flash("Du måste vara inloggad för att överföra en biljett.", "warning")
+        return redirect(url_for('login'))
+
+    current_user_email = session['user']['email'].lower()
+    recipient_email = request.form.get('recipient_email', '').strip().lower()
+
+    if not recipient_email or recipient_email == current_user_email:
+        flash("Ogiltig mottagare.", "danger")
+        return redirect(url_for('user_account'))
+
+    original_order = next(
+        (o for o in ORDERS if o.get('id') == order_id and o.get('customer_email', '').lower() == current_user_email),
+        None)
+    ticket_item = next((it for it in original_order.get('order_items', []) if
+                        it.get('name') == item_name and it.get('type') == 'ticket') if original_order else None, None)
+
+    if not ticket_item:
+        flash("Biljetten kunde inte hittas.", "danger")
+        return redirect(url_for('user_account'))
+
+    old_ticket_code = ticket_item.get('ticket_code', f"TICKET-{order_id}-{item_name}")
+    if any(s.get('ticket_code') == old_ticket_code for s in TICKET_SCANS):
+        flash("❌ Denna biljett har redan skannats i entrén och kan inte överföras.", "danger")
+        return redirect(url_for('user_account'))
+
+    transfer_request = {
+        "id": random.randint(10000, 99999),
+        "order_id": order_id,
+        "sender_email": current_user_email,
+        "sender_name": session['user'].get('name', 'Gäst'),
+        "recipient_email": recipient_email,
+        "ticket_name": item_name,
+        "old_ticket_code": old_ticket_code,
+        "request_date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "status": "PENDING"
+    }
+
+    if not hasattr(app, 'PENDING_TRANSFERS'):
+        app.PENDING_TRANSFERS = []
+    app.PENDING_TRANSFERS.insert(0, transfer_request)
+
+    log_admin_action("Överföringsbegäran",
+                     f"Överföring begärd av {current_user_email} till {recipient_email} för '{item_name}'.")
+    flash("⏳ Din överföringsbegäran har skickats till administratören för godkännande.", "info")
+    return redirect(url_for('user_account'))
+
+
+@app.route('/admin/process_transfer/<int:transfer_id>/<action>', methods=['POST'])
+def process_transfer(transfer_id, action):
+    if not session.get('admin_logged'):
+        return redirect(url_for('admin_login'))
+
+    pending_list = getattr(app, 'PENDING_TRANSFERS', [])
+    req = next((r for r in pending_list if r['id'] == transfer_id and r['status'] == 'PENDING'), None)
+
+    if not req:
+        flash("Överföringsbegäran hittades inte.", "danger")
+        return redirect(url_for('admin_dashboard'))
+
+    if action == 'approve':
+        req['status'] = 'APPROVED'
+
+        orig_order = next((o for o in ORDERS if o.get('id') == req['order_id']), None)
+        if orig_order:
+            orig_order['order_items'] = [it for it in orig_order['order_items'] if it.get('name') != req['ticket_name']]
+
+        new_order_id = random.randint(10000, 99999)
+        new_ticket_code = f"TRANSFER-{new_order_id}-{random.randint(1000, 9999)}"
+
+        transferred_order = {
+            "id": new_order_id,
+            "customer_email": req['recipient_email'],
+            "customer_name": req['recipient_email'].split('@')[0].capitalize(),
+            "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "order_items": [{
+                "id": 999,
+                "name": f"{req['ticket_name']} (Överförd)",
+                "price": 0,
+                "quantity": 1,
+                "type": "ticket",
+                "ticket_code": new_ticket_code
+            }],
+            "total": 0,
+            "shipping": "Digital Överföring",
+            "status": f"Godkänd överföring från {req['sender_name']}"
+        }
+        ORDERS.insert(0, transferred_order)
+        log_admin_action("Överföring Godkänd", f"Biljett godkändes för överföring till {req['recipient_email']}.")
+        flash(f"✅ Överföringen till {req['recipient_email']} har godkänts!", "success")
+
+    elif action == 'reject':
+        req['status'] = 'REJECTED'
+        log_admin_action("Överföring Avslagen", f"Överföring från {req['sender_email']} avslogs.")
+        flash(f"❌ Överföringsbegäran avslogs.", "warning")
+
+    return redirect(url_for('admin_dashboard') + '#transfers-section')
+
+def send_ticket_transfer_email(recipient_email, sender_name, event_name):
+    print(f"[EMAIL TRANSFERT] Skickat till {recipient_email}: Hej! {sender_name} har överfört sin biljett för '{event_name}' till dig på URBAN NATION. Logga in eller skapa ett konto med denna e-post för att hämta din nya QR-kod!")
+
+
 # --- STYLES HARMONISÉS NOIR & BLANC (SANS JAUNE, TEXTES LISIBLES) ---
 
 COMMON_STYLES = """
@@ -988,7 +1740,7 @@ COMMON_STYLES = """
             --border-color: #e5e5e5;
         }
 
-        /* Mode Clair par défaut : Fond Blanc avec multi-logos répétés Urban Nation */
+        /* Thème clair unifié */
         body {
             font-family: 'Inter', sans-serif;
             background-color: #ffffff !important;
@@ -996,7 +1748,7 @@ COMMON_STYLES = """
             position: relative;
         }
 
-        /* Multiples petits logos répétés en arrière-plan (Pattern / Wallpaper) */
+        /* Pattern de logos répétés en arrière-plan */
         body::before {
             content: "";
             position: fixed;
@@ -1005,22 +1757,12 @@ COMMON_STYLES = """
             width: 100vw;
             height: 100vh;
             background-image: url('/static/uploads/image1.jpeg');
-            background-repeat: repeat; /* Répète le logo partout sur la page */
+            background-repeat: repeat;
             background-position: 0 0;
-            background-size: 80px 80px; /* Taille de chaque petit logo */
-            opacity: 0.025; /* Très discret et élégant */
+            background-size: 80px 80px;
+            opacity: 0.025;
             pointer-events: none;
             z-index: -1;
-        }
-
-        /* Mode Sombre (Dark Mode) */
-        body.dark-mode {
-            background-color: #0f0f12 !important;
-            color: #ffffff !important;
-        }
-        body.dark-mode::before {
-            filter: invert(1) brightness(2); /* Inverse les logos en blanc sur fond sombre */
-            opacity: 0.035;
         }
 
         h1, h2, h3, h4, h5, .brand-font {
@@ -1060,15 +1802,13 @@ COMMON_STYLES = """
             color: #666666 !important;
         }
 
-        .badge.bg-dark, 
-        body.dark-mode .badge.bg-dark {
+        .badge.bg-dark {
             background-color: #0d0d0d !important;
             color: #ffffff !important;
             border: 1px solid #444444 !important;
         }
 
-        .badge.bg-danger, 
-        body.dark-mode .badge.bg-danger {
+        .badge.bg-danger {
             background-color: #dc3545 !important;
             color: #ffffff !important;
             border-color: #dc3545 !important;
@@ -1096,49 +1836,20 @@ COMMON_STYLES = """
             border-radius: 8px;
         }
 
-        body.dark-mode h1, body.dark-mode h2, body.dark-mode h3, body.dark-mode h4, body.dark-mode h5 {
-            color: #ffffff !important;
+        .gallery-thumb { 
+            width: 44px; 
+            height: 44px; 
+            object-fit: cover; 
+            cursor: pointer; 
+            border: 2px solid transparent; 
+            border-radius: 6px; 
         }
-
-        body.dark-mode .card, body.dark-mode .bg-white, body.dark-mode .bg-light {
-            background-color: #18181c !important;
-            color: #ffffff !important;
-            border-color: #2a2a30 !important;
+        .gallery-thumb:hover, .gallery-thumb.active { 
+            border-color: #111111; 
         }
-
-        body.dark-mode .card .card-title, body.dark-mode .card h5, body.dark-mode .card h4, body.dark-mode .card p, body.dark-mode .card span {
-            color: #ffffff !important;
-        }
-
-        body.dark-mode .btn-link, 
-        body.dark-mode .card .btn-link {
-            color: #ffffff !important;
-        }
-
-        body.dark-mode .text-decoration-line-through,
-        body.dark-mode .card .text-muted, 
-        body.dark-mode .text-muted { 
-            color: #bbbbbb !important; 
-        }
-
-        body.dark-mode .btn-outline-dark {
-            color: #ffffff !important;
-            border-color: #ffffff !important;
-        }
-
-        body.dark-mode select.form-select {
-            background-color: #2b2b36 !important;
-            color: #ffffff !important;
-            border-color: #444455 !important;
-        }
-
-        .gallery-thumb { width: 44px; height: 44px; object-fit: cover; cursor: pointer; border: 2px solid transparent; border-radius: 6px; }
-        .gallery-thumb:hover, .gallery-thumb.active { border-color: #111111; }
 
         .countdown-timer,
-        .countdown-timer *,
-        body.dark-mode .countdown-timer,
-        body.dark-mode .countdown-timer * {
+        .countdown-timer * {
             font-family: monospace !important;
             font-size: 0.85rem !important;
             font-weight: 700 !important;
@@ -1173,15 +1884,12 @@ HOME_TEMPLATE = """
             transform: translate(-50%, -50%) rotate(-20deg);
             font-size: 7.5rem;
             font-weight: 900;
-            color: rgba(255, 255, 255, 0.04); /* Très subtil en Dark Mode */
+            color: rgba(0, 0, 0, 0.04); /* Très subtil en Light Mode */
             white-space: nowrap;
             pointer-events: none;
             z-index: 0;
             font-family: 'Montserrat', sans-serif;
             letter-spacing: 4px;
-        }
-        body:not(.dark-mode) .bg-urban-watermark::before {
-            color: rgba(0, 0, 0, 0.04); /* Très subtil en Light Mode */
         }
     </style>
 </head>
@@ -1204,10 +1912,9 @@ HOME_TEMPLATE = """
                     <li class="nav-item"><a class="nav-link" href="#footer-section">Om oss</a></li>
                 </ul>
                 <div class="d-flex align-items-center gap-2">
-                    <button id="themeToggleBtn" class="btn btn-outline-light btn-sm me-2" onclick="toggleDarkMode()">🌙 Dark</button>
                     {% if current_user %}
                         <a href="/account" class="btn btn-outline-light btn-sm">👤 Konto ({{ current_user.first_name if current_user.first_name else current_user.name.split()[0] }})</a>
-                        <a href="/logout" class="btn btn-outline-danger btn-sm">Logga ut</a>
+                        <a href="/logout" class="btn btn-danger btn-sm">Logga ut</a>
                     {% else %}
                         <a href="/login" class="btn btn-outline-light btn-sm">Logga in</a>
                         <a href="/register" class="btn btn-warning btn-sm">Skapa konto</a>
@@ -1226,7 +1933,7 @@ HOME_TEMPLATE = """
             {% endfor %}
           {% endif %}
         {% endwith %}
-
+    
         <!-- Hero Banner avec filigrane Urban Nation en arrière-plan -->
         <div class="p-5 mb-5 text-white rounded-4 shadow-lg text-center position-relative overflow-hidden bg-urban-watermark" 
              style="background: linear-gradient(rgba(0,0,0,0.75), rgba(0,0,0,0.88)), url('{{ hero_bg }}') center/cover no-repeat;">
@@ -1240,9 +1947,27 @@ HOME_TEMPLATE = """
                 <a href="#events-section" class="btn btn-outline-light btn-lg px-4">Boka Eventbiljetter</a>
             </div>
         </div>
-
+        
         <hr class="my-4">
-
+    
+        <!-- 🚀 AFFICHAGE DE L'ANNONCE GLOBALE "UNDER FÖRBEREDELSE" SI ACTIVÉE -->
+        {% if global_announcement and global_announcement.active %}
+            <div class="alert alert-warning border border-warning shadow-sm rounded-4 p-4 mb-4 position-relative" role="alert">
+                <div class="d-flex align-items-start gap-3">
+                    <div class="fs-2">🚧</div>
+                    <div class="flex-grow-1">
+                        <h4 class="alert-heading fw-bold text-dark mb-1">Under förberedelse</h4>
+                        <p class="mb-2 text-dark fs-6">{{ global_announcement.text }}</p>
+                        {% if global_announcement.image %}
+                            <div class="mt-2">
+                                <img src="{{ global_announcement.image }}" alt="Annonce" style="max-height: 180px; border-radius: 8px; object-fit: cover;" class="shadow-sm">
+                            </div>
+                        {% endif %}
+                    </div>
+                </div>
+            </div>
+        {% endif %}
+        
         <div id="events-section" class="pt-3">
             <div class="d-flex justify-content-between align-items-center mb-4">
                 <h2>Kommande Evenemang & Fester</h2>
@@ -1262,28 +1987,51 @@ HOME_TEMPLATE = """
                                         <span class="badge bg-dark text-white border border-secondary px-2 py-1" style="background-color: #0d0d0d !important; color: #ffffff !important;">
                                             ⏳ <span class="countdown-timer" data-date="{{ event.date }}" style="color: #ffffff !important;">Räknar ner...</span>
                                         </span>
+                                        {% if event.min_age %}
+                                        <span class="badge bg-secondary">🔞 Åldersgräns: {{ event.min_age }} år</span>
+                                        {% endif %}
                                     </div>
                                     <h4 class="card-title h5">{{ event.title }}</h4>
                                     <p class="text-muted small mb-2">📍 {{ event.location }} (⏰ {{ event.time }})</p>
                                     <p class="card-text text-muted small flex-grow-1">{{ event.desc }}</p>
-
-                                    <div class="mt-3">
-                                        {% set match_id = 3 %}
-                                        {% for p in products %}
-                                            {% if event.title in p.name %}{% set match_id = p.id %}{% endif %}
-                                        {% endfor %}
-
-                                        <form action="/add/{{ match_id }}" method="POST">
-                                            <div class="input-group input-group-sm mb-2">
-                                                <label class="input-group-text bg-secondary text-white">Biljettyp</label>
-                                                <select class="form-select form-select-sm" name="ticket_category">
-                                                    <option value="early">Early Bird (-20%): {{ (event.price * 0.8)|int }} SEK</option>
-                                                    <option value="standard" selected>Standard: {{ event.price }} SEK</option>
-                                                    <option value="vip">VIP / Fast Track (+50%): {{ (event.price * 1.5)|int }} SEK</option>
-                                                </select>
+        
+                                    <!-- Jauges visuelles par zone / catégorie définie par l'admin -->
+                                    <div class="mt-2">
+                                        <h6 class="fw-bold mb-2 small text-uppercase">Välj biljettyp & tillgängliga zoner:</h6>
+                                    
+                                        {% set categories = event.categories if event.categories else [
+                                            {"name": "Standard", "price": event.price, "total_stock": 100, "sold": 0}
+                                        ] %}
+                                    
+                                        {% for cat in categories %}
+                                        <div class="mb-2 p-2 border rounded bg-light">
+                                            <div class="d-flex justify-content-between mb-1" style="font-size: 0.85rem;">
+                                                <strong>{{ cat.name }}</strong>
+                                                <span class="fw-bold">{{ cat.price }} SEK</span>
                                             </div>
-                                            <button type="submit" class="btn btn-dark btn-sm w-100">Boka Biljett Nu</button>
-                                        </form>
+                                            {% set stock_total = cat.total_stock if cat.total_stock > 0 else 100 %}
+                                            {% set sold_count = cat.sold if cat.sold else 0 %}
+                                            {% set percent = ((sold_count / stock_total) * 100)|round %}
+                                            
+                                            <div class="progress mb-1" style="height: 6px;">
+                                                <div class="progress-bar {% if percent > 85 %}bg-danger{% else %}bg-dark{% endif %}" style="width: {{ percent }}%;"></div>
+                                            </div>
+                                            <div class="d-flex justify-content-between text-muted" style="font-size: 0.7rem;">
+                                                <span>{{ stock_total - sold_count }} platser kvar</span>
+                                                <span>{{ percent }}% Sålt</span>
+                                            </div>
+                                    
+                                            {% set match_id = 3 %}
+                                            {% for p in products %}
+                                                {% if event.title in p.name %}{% set match_id = p.id %}{% endif %}
+                                            {% endfor %}
+                                    
+                                            <form action="/add/{{ match_id }}" method="POST" class="mt-1">
+                                                <input type="hidden" name="ticket_category" value="{{ cat.name|lower }}">
+                                                <button type="submit" class="btn btn-dark btn-sm w-100" style="font-size: 0.75rem; padding: 2px;">Boka {{ cat.name }}</button>
+                                            </form>
+                                        </div>
+                                        {% endfor %}
                                     </div>
                                 </div>
                             </div>
@@ -1440,7 +2188,7 @@ HOME_TEMPLATE = """
         </div>
     </div>
 
-    <!-- Modals, footer et scripts conservés -->
+    <!-- Modals, footer et scripts -->
     <div class="modal fade" id="sizeGuideModal" tabindex="-1">
       <div class="modal-dialog modal-dialog-centered">
         <div class="modal-content">
@@ -1499,26 +2247,6 @@ HOME_TEMPLATE = """
     </footer>
 
     <script>
-        function toggleDarkMode() {
-            document.body.classList.toggle('dark-mode');
-            const isDark = document.body.classList.contains('dark-mode');
-            localStorage.setItem('theme', isDark ? 'dark' : 'light');
-            document.getElementById('themeToggleBtn').innerText = isDark ? '☀️ Light' : '🌙 Dark';
-        }
-
-        document.addEventListener('DOMContentLoaded', function() {
-            const savedTheme = localStorage.getItem('theme');
-            if (savedTheme === 'dark') {
-                document.body.classList.add('dark-mode');
-                const btn = document.getElementById('themeToggleBtn');
-                if (btn) btn.innerText = '☀️ Light';
-            } else {
-                document.body.classList.remove('dark-mode');
-                const btn = document.getElementById('themeToggleBtn');
-                if (btn) btn.innerText = '🌙 Dark';
-            }
-        });
-
         function updateCountdowns() {
             const timers = document.querySelectorAll('.countdown-timer');
             timers.forEach(timer => {
@@ -1607,13 +2335,54 @@ USER_LOGIN_TEMPLATE = """
             {% with messages = get_flashed_messages(with_categories=true) %}
               {% if messages %}{% for c, m in messages %}<div class="alert alert-{{ c }}">{{ m }}</div>{% endfor %}{% endif %}
             {% endwith %}
+
             <form method="POST">
-                <div class="mb-3"><label class="form-label">E-postadress</label><input type="email" class="form-control" name="email" required placeholder="namn@example.se"></div>
-                <div class="mb-3"><label class="form-label">Lösenord</label><input type="password" class="form-control" name="password" required placeholder="Ditt lösenord"></div>
+                <div class="mb-3">
+                    <label class="form-label">E-postadress</label>
+                    <input type="email" class="form-control" name="email" required placeholder="namn@example.se">
+                </div>
+                <div class="mb-3">
+                    <label class="form-label">Lösenord</label>
+                    <input type="password" class="form-control" name="password" required placeholder="Ditt lösenord">
+                </div>
                 <button type="submit" class="btn btn-dark w-100 btn-lg">Logga in</button>
             </form>
+
+            <!-- Authentification sociale (Google, Apple, Facebook, Instagram, TikTok) -->
+            <div class="d-flex align-items-center my-4">
+                <hr class="flex-grow-1 border-secondary">
+                <span class="px-2 text-muted small fw-bold">eller fortsätt med</span>
+                <hr class="flex-grow-1 border-secondary">
+            </div>
+
+            <div class="d-flex flex-column gap-2">
+                <a href="/login/google" class="btn btn-outline-dark w-100 d-flex align-items-center justify-content-center gap-2 py-2 fw-semibold">
+                    <svg width="18" height="18" viewBox="0 0 24 24"><path fill="currentColor" d="M12.545 10.239v3.821h5.445c-.712 2.315-2.647 3.972-5.445 3.972a6.033 6.033 0 1 1 6.033-6.033c0 .337-.027.668-.078.991h3.918A10.024 10.024 0 0 0 12.545 2C6.98 2 2.47 6.51 2.47 12.075c0 5.564 4.51 10.075 10.075 10.075 6.115 0 10.075-4.304 10.075-10.239 0-.583-.051-1.156-.145-1.672h-9.93z"/></svg>
+                    Fortsätt med Google
+                </a>
+                <a href="/login/apple" class="btn btn-outline-dark w-100 d-flex align-items-center justify-content-center gap-2 py-2 fw-semibold">
+                    <svg width="18" height="18" viewBox="0 0 24 24"><path fill="currentColor" d="M18.71 19.5c-.83 1.24-1.71 2.45-3.05 2.47-1.34.03-1.77-.79-3.29-.79-1.53 0-2 .77-3.27.82-1.31.05-2.3-1.32-3.14-2.53C4.25 17 2.94 12.45 4.7 9.39c.87-1.52 2.43-2.48 4.12-2.51 1.28-.02 2.5.87 3.29.87.78 0 2.26-1.07 3.81-.91.65.03 2.47.26 3.64 1.98-.09.06-2.17 1.28-2.15 3.81.03 3.02 2.65 4.03 2.68 4.04-.03.07-.42 1.44-1.38 2.83M15.97 6.85c.67-.82 1.13-1.96.99-3.1-.98.04-2.19.66-2.88 1.47-.62.72-1.16 1.89-.99 3.02 1.1.09 2.23-.55 2.88-1.39"/></svg>
+                    Fortsätt med Apple
+                </a>
+                <a href="/login/facebook" class="btn btn-outline-dark w-100 d-flex align-items-center justify-content-center gap-2 py-2 fw-semibold">
+                    <svg width="18" height="18" viewBox="0 0 24 24"><path fill="currentColor" d="M22 12c0-5.52-4.48-10-10-10S2 6.48 2 12c0 4.84 3.44 8.87 8 9.8V15H7.5v-3H10V9.5C10 7.01 11.49 5.6 13.78 5.6c1.1 0 2.25.2 2.25.2v2.48h-1.27c-1.23 0-1.62.77-1.62 1.56V12h2.78l-.44 3h-2.34v6.8c4.56-.93 8-4.96 8-9.8z"/></svg>
+                    Fortsätt med Facebook
+                </a>
+                <a href="/login/instagram" class="btn btn-outline-dark w-100 d-flex align-items-center justify-content-center gap-2 py-2 fw-semibold">
+                    <svg width="18" height="18" viewBox="0 0 24 24"><path fill="currentColor" d="M12 2.163c3.204 0 3.584.012 4.85.07 3.252.148 4.771 1.691 4.919 4.919.058 1.265.069 1.645.069 4.849 0 3.205-.012 3.584-.069 4.849-.149 3.225-1.664 4.771-4.919 4.919-1.266.058-1.644.07-4.85.07-3.204 0-3.584-.012-4.849-.07-3.26-.149-4.771-1.699-4.919-4.92-.058-1.265-.07-1.644-.07-4.849 0-3.204.013-3.583.07-4.849.149-3.227 1.664-4.771 4.919-4.919 1.266-.057 1.645-.069 4.849-.069zm0-2.163c-3.259 0-3.667.014-4.947.072-4.358.2-6.78 2.618-6.98 6.98-.059 1.281-.073 1.689-.073 4.948 0 3.259.014 3.668.072 4.948.2 4.358 2.618 6.78 6.98 6.98 1.281.058 1.689.072 4.948.072 3.259 0 3.668-.014 4.948-.072 4.354-.2 6.782-2.618 6.979-6.98.059-1.28.073-1.689.073-4.948 0-3.259-.014-3.667-.072-4.947-.196-4.354-2.617-6.78-6.979-6.98-1.281-.059-1.69-.073-4.949-.073zm0 5.838c-3.403 0-6.162 2.759-6.162 6.162s2.759 6.163 6.162 6.163 6.162-2.759 6.162-6.163c0-3.403-2.759-6.162-6.162-6.162zm0 10.162c-2.209 0-4-1.79-4-4 0-2.209 1.791-4 4-4s4 1.791 4 4c0 2.21-1.791 4-4 4zm6.406-11.845c-.796 0-1.441.645-1.441 1.44s.645 1.44 1.441 1.44c.795 0 1.439-.645 1.439-1.44s-.644-1.44-1.439-1.44z"/></svg>
+                    Fortsätt med Instagram
+                </a>
+                <a href="/login/tiktok" class="btn btn-outline-dark w-100 d-flex align-items-center justify-content-center gap-2 py-2 fw-semibold">
+                    <svg width="18" height="18" viewBox="0 0 24 24"><path fill="currentColor" d="M12.525.02c1.31-.02 2.61-.01 3.91-.02.08 1.53.63 3.09 1.75 4.17 1.12 1.11 2.7 1.62 4.24 1.79v4.03c-1.44-.05-2.89-.35-4.2-.97-.57-.26-1.1-.59-1.62-.93-.01 2.92.01 5.84-.02 8.75-.08 1.4-.54 2.79-1.35 3.94-1.31 1.92-3.58 3.17-5.91 3.21-1.43.08-2.86-.31-4.08-1.03-2.02-1.19-3.44-3.37-3.65-5.71-.02-.5-.03-1-.01-1.49.18-1.9 1.12-3.72 2.58-4.96 1.66-1.44 3.98-2.13 6.15-1.72.02 1.48-.04 2.96-.04 4.44-.99-.32-2.15-.23-3.02.37-.82.56-1.36 1.5-1.42 2.5-.06 1.08.38 2.16 1.17 2.87.82.73 1.98 1.05 3.07.84 1.11-.2 2.08-.94 2.56-1.96.24-.52.35-1.1.34-1.68.02-3.67.01-7.34.01-11.01z"/></svg>
+                    Fortsätt med TikTok
+                </a>
+            </div>
+
             <hr class="my-4">
-            <div class="text-center"><p class="text-muted mb-1">Har du inget konto än?</p><a href="/register" class="btn btn-outline-dark btn-sm">Skapa ett konto här</a></div>
+            <div class="text-center">
+                <p class="text-muted mb-1">Har du inget konto än?</p>
+                <a href="/register" class="btn btn-outline-dark btn-sm">Skapa ett konto här</a>
+            </div>
             <a href="/" class="btn btn-link mt-3 text-center d-block text-dark">&larr; Tillbaka till URBAN NATION</a>
         </div>
     </div>
@@ -1735,6 +2504,7 @@ USER_REGISTER_TEMPLATE = """
             {% with messages = get_flashed_messages(with_categories=true) %}
               {% if messages %}{% for c, m in messages %}<div class="alert alert-{{ c }}">{{ m }}</div>{% endfor %}{% endif %}
             {% endwith %}
+
             <form method="POST">
                 <div class="row mb-3">
                     <div class="col-md-6"><label class="form-label">Förnamn</label><input type="text" class="form-control" name="first_name" required placeholder="Anna"></div>
@@ -1755,6 +2525,37 @@ USER_REGISTER_TEMPLATE = """
                 </div>
                 <button type="submit" class="btn btn-dark w-100 btn-lg">Skapa Mitt Konto</button>
             </form>
+
+            <!-- Social Logins (Google, Apple, Facebook, Instagram, TikTok) pour l'inscription -->
+            <div class="d-flex align-items-center my-4">
+                <hr class="flex-grow-1 border-secondary">
+                <span class="px-2 text-muted small fw-bold">eller registrera dig med</span>
+                <hr class="flex-grow-1 border-secondary">
+            </div>
+
+            <div class="d-flex flex-column gap-2">
+                <a href="/login/google" class="btn btn-outline-dark w-100 d-flex align-items-center justify-content-center gap-2 py-2 fw-semibold">
+                    <svg width="18" height="18" viewBox="0 0 24 24"><path fill="currentColor" d="M12.545 10.239v3.821h5.445c-.712 2.315-2.647 3.972-5.445 3.972a6.033 6.033 0 1 1 6.033-6.033c0 .337-.027.668-.078.991h3.918A10.024 10.024 0 0 0 12.545 2C6.98 2 2.47 6.51 2.47 12.075c0 5.564 4.51 10.075 10.075 10.075 6.115 0 10.075-4.304 10.075-10.239 0-.583-.051-1.156-.145-1.672h-9.93z"/></svg>
+                    Fortsätt med Google
+                </a>
+                <a href="/login/apple" class="btn btn-outline-dark w-100 d-flex align-items-center justify-content-center gap-2 py-2 fw-semibold">
+                    <svg width="18" height="18" viewBox="0 0 24 24"><path fill="currentColor" d="M18.71 19.5c-.83 1.24-1.71 2.45-3.05 2.47-1.34.03-1.77-.79-3.29-.79-1.53 0-2 .77-3.27.82-1.31.05-2.3-1.32-3.14-2.53C4.25 17 2.94 12.45 4.7 9.39c.87-1.52 2.43-2.48 4.12-2.51 1.28-.02 2.5.87 3.29.87.78 0 2.26-1.07 3.81-.91.65.03 2.47.26 3.64 1.98-.09.06-2.17 1.28-2.15 3.81.03 3.02 2.65 4.03 2.68 4.04-.03.07-.42 1.44-1.38 2.83M15.97 6.85c.67-.82 1.13-1.96.99-3.1-.98.04-2.19.66-2.88 1.47-.62.72-1.16 1.89-.99 3.02 1.1.09 2.23-.55 2.88-1.39"/></svg>
+                    Fortsätt med Apple
+                </a>
+                <a href="/login/facebook" class="btn btn-outline-dark w-100 d-flex align-items-center justify-content-center gap-2 py-2 fw-semibold">
+                    <svg width="18" height="18" viewBox="0 0 24 24"><path fill="currentColor" d="M22 12c0-5.52-4.48-10-10-10S2 6.48 2 12c0 4.84 3.44 8.87 8 9.8V15H7.5v-3H10V9.5C10 7.01 11.49 5.6 13.78 5.6c1.1 0 2.25.2 2.25.2v2.48h-1.27c-1.23 0-1.62.77-1.62 1.56V12h2.78l-.44 3h-2.34v6.8c4.56-.93 8-4.96 8-9.8z"/></svg>
+                    Fortsätt med Facebook
+                </a>
+                <a href="/login/instagram" class="btn btn-outline-dark w-100 d-flex align-items-center justify-content-center gap-2 py-2 fw-semibold">
+                    <svg width="18" height="18" viewBox="0 0 24 24"><path fill="currentColor" d="M12 2.163c3.204 0 3.584.012 4.85.07 3.252.148 4.771 1.691 4.919 4.919.058 1.265.069 1.645.069 4.849 0 3.205-.012 3.584-.069 4.849-.149 3.225-1.664 4.771-4.919 4.919-1.266.058-1.644.07-4.85.07-3.204 0-3.584-.012-4.849-.07-3.26-.149-4.771-1.699-4.919-4.92-.058-1.265-.07-1.644-.07-4.849 0-3.204.013-3.583.07-4.849.149-3.227 1.664-4.771 4.919-4.919 1.266-.057 1.645-.069 4.849-.069zm0-2.163c-3.259 0-3.667.014-4.947.072-4.358.2-6.78 2.618-6.98 6.98-.059 1.281-.073 1.689-.073 4.948 0 3.259.014 3.668.072 4.948.2 4.358 2.618 6.78 6.98 6.98 1.281.058 1.689.072 4.948.072 3.259 0 3.668-.014 4.948-.072 4.354-.2 6.782-2.618 6.979-6.98.059-1.28.073-1.689.073-4.948 0-3.259-.014-3.667-.072-4.947-.196-4.354-2.617-6.78-6.979-6.98-1.281-.059-1.69-.073-4.949-.073zm0 5.838c-3.403 0-6.162 2.759-6.162 6.162s2.759 6.163 6.162 6.163 6.162-2.759 6.162-6.163c0-3.403-2.759-6.162-6.162-6.162zm0 10.162c-2.209 0-4-1.79-4-4 0-2.209 1.791-4 4-4s4 1.791 4 4c0 2.21-1.791 4-4 4zm6.406-11.845c-.796 0-1.441.645-1.441 1.44s.645 1.44 1.441 1.44c.795 0 1.439-.645 1.439-1.44s-.644-1.44-1.439-1.44z"/></svg>
+                    Fortsätt med Instagram
+                </a>
+                <a href="/login/tiktok" class="btn btn-outline-dark w-100 d-flex align-items-center justify-content-center gap-2 py-2 fw-semibold">
+                    <svg width="18" height="18" viewBox="0 0 24 24"><path fill="currentColor" d="M12.525.02c1.31-.02 2.61-.01 3.91-.02.08 1.53.63 3.09 1.75 4.17 1.12 1.11 2.7 1.62 4.24 1.79v4.03c-1.44-.05-2.89-.35-4.2-.97-.57-.26-1.1-.59-1.62-.93-.01 2.92.01 5.84-.02 8.75-.08 1.4-.54 2.79-1.35 3.94-1.31 1.92-3.58 3.17-5.91 3.21-1.43.08-2.86-.31-4.08-1.03-2.02-1.19-3.44-3.37-3.65-5.71-.02-.5-.03-1-.01-1.49.18-1.9 1.12-3.72 2.58-4.96 1.66-1.44 3.98-2.13 6.15-1.72.02 1.48-.04 2.96-.04 4.44-.99-.32-2.15-.23-3.02.37-.82.56-1.36 1.5-1.42 2.5-.06 1.08.38 2.16 1.17 2.87.82.73 1.98 1.05 3.07.84 1.11-.2 2.08-.94 2.56-1.96.24-.52.35-1.1.34-1.68.02-3.67.01-7.34.01-11.01z"/></svg>
+                    Fortsätt med TikTok
+                </a>
+            </div>
+
             <div class="text-center mt-3"><a href="/login" class="text-dark">Har du redan ett konto? Logga in här</a></div>
             <a href="/" class="btn btn-link mt-2 text-center d-block text-dark">&larr; Tillbaka till URBAN NATION</a>
         </div>
@@ -1788,12 +2589,13 @@ USER_ACCOUNT_TEMPLATE = """
 
     <div class="container my-5">
         {% with messages = get_flashed_messages(with_categories=true) %}
-          {% if messages %}{% for c, m in messages %}<div class="alert alert-{{ c }}">{{ m }}</div>{% endfor %}{% endif %}
+          {% if messages %}{% for c, m in messages %}<div class="alert alert-{{ c }} shadow-sm rounded-3">{{ m }}</div>{% endfor %}{% endif %}
         {% endwith %}
 
         <div class="row">
+            <!-- Profil och ändring av personuppgifter -->
             <div class="col-md-4 mb-4">
-                <div class="card p-4 shadow-sm bg-white">
+                <div class="card p-4 shadow-sm bg-white border-0">
                     <div class="text-center mb-3">
                         <div class="bg-dark text-white rounded-circle d-inline-flex align-items-center justify-content-center fw-bold" style="width: 70px; height: 70px; font-size: 28px;">
                             {{ current_user.first_name[0] if current_user.first_name else current_user.name[0] }}
@@ -1819,85 +2621,205 @@ USER_ACCOUNT_TEMPLATE = """
                 </div>
             </div>
 
+            <!-- Historik, Orderstatus & Eventbiljetter -->
             <div class="col-md-8">
-                <div class="card p-4 shadow-sm bg-white mb-4">
-                    <h3 class="mb-3">🛍️ Mina Beställningar & Spårning</h3>
+                <!-- Section Köphistorik & Orderstatus -->
+                <div class="card p-4 shadow-sm bg-white mb-4 border-0">
+                    <div class="d-flex justify-content-between align-items-center mb-4">
+                        <h3 class="mb-0">Köphistorik & Orderstatus</h3>
+                        <span class="badge bg-dark fs-6">{{ orders|length if orders else 0 }} Beställningar</span>
+                    </div>
+
                     {% if orders %}
                         {% for order in orders %}
-                        <div class="border rounded-3 p-3 mb-3 bg-light">
-                            <div class="d-flex justify-content-between align-items-center mb-2">
+                        <div class="border rounded-3 p-3 mb-4 bg-light shadow-sm">
+                            <!-- En-tête de la commande -->
+                            <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-3 pb-2 border-bottom">
                                 <div>
-                                    <strong>Order #{{ order.id }}</strong>
-                                    <span class="text-muted small ms-2">📅 {{ order.date }}</span>
+                                    <strong class="fs-5 text-dark">Order #{{ order.id }}</strong>
+                                    <span class="text-muted small ms-2">{{ order.date }}</span>
                                 </div>
-                                <span class="badge bg-dark text-white">{{ order.status }}</span>
+                                <div>
+                                    {% if 'VIP' in order.status %}
+                                        <span class="badge bg-warning text-dark px-3 py-2 fs-6">🎁 VIP Inbjudan</span>
+                                    {% elif 'Mottagen' in order.status %}
+                                        <span class="badge bg-info text-dark px-3 py-2 fs-6">🔄 Överförd</span>
+                                    {% elif order.status == 'Skickad' %}
+                                        <span class="badge bg-primary px-3 py-2 fs-6">Skickad</span>
+                                    {% elif order.status == 'Levererad / Avslutad' %}
+                                        <span class="badge bg-success px-3 py-2 fs-6">Levererad</span>
+                                    {% else %}
+                                        <span class="badge bg-warning text-dark px-3 py-2 fs-6">Under behandling</span>
+                                    {% endif %}
+                                </div>
                             </div>
-                            <ul class="list-group mb-2">
+
+                            <!-- Barre de progression du statut de la commande -->
+                            <div class="mb-4 px-2">
+                                <div class="progress" style="height: 8px;">
+                                    {% if order.status == 'Levererad / Avslutad' or 'VIP' in order.status or 'Mottagen' in order.status %}
+                                        <div class="progress-bar bg-success" style="width: 100%;"></div>
+                                    {% elif order.status == 'Skickad' %}
+                                        <div class="progress-bar bg-primary" style="width: 66%;"></div>
+                                    {% else %}
+                                        <div class="progress-bar bg-warning" style="width: 33%;"></div>
+                                    {% endif %}
+                                </div>
+                                <div class="d-flex justify-content-between text-muted small mt-1" style="font-size: 0.75rem;">
+                                    <span class="fw-bold text-dark">1. Mottagen</span>
+                                    <span class="{% if order.status in ['Skickad', 'Levererad / Avslutad'] or 'VIP' in order.status or 'Mottagen' in order.status %}fw-bold text-dark{% endif %}">2. Behandlas</span>
+                                    <span class="{% if order.status in ['Skickad', 'Levererad / Avslutad'] or 'VIP' in order.status or 'Mottagen' in order.status %}fw-bold text-dark{% endif %}">3. Skickad</span>
+                                    <span class="{% if order.status == 'Levererad / Avslutad' or 'VIP' in order.status or 'Mottagen' in order.status %}fw-bold text-success{% endif %}">4. Levererad</span>
+                                </div>
+                            </div>
+
+                            <!-- Liste des articles de la commande -->
+                            <h6 class="fw-bold mb-2 text-muted">Köpta Artiklar / Inbjudningar</h6>
+                            <ul class="list-group mb-3">
                                 {% for item in order.order_items %}
                                 <li class="list-group-item d-flex justify-content-between align-items-center py-2">
-                                    <span>{% if item.type == 'ticket' %}🎫{% else %}👕{% endif %} <strong>{{ item.name }}</strong></span>
-                                    <span>{{ item.price }} SEK</span>
+                                    <div>
+                                        <span>{% if item.type == 'ticket' %}🎫{% else %}🛍️{% endif %} <strong>{{ item.name }}</strong></span>
+                                        {% if item.size or item.color %}
+                                            <small class="text-muted d-block" style="font-size: 0.8rem;">
+                                                {% if item.size %}Storlek: {{ item.size }}{% endif %}
+                                                {% if item.color %} | Färg: {{ item.color }}{% endif %}
+                                            </small>
+                                        {% endif %}
+                                    </div>
+                                    <span class="fw-bold text-dark">{{ item.price }} SEK</span>
                                 </li>
                                 {% endfor %}
                             </ul>
-                            <div class="d-flex justify-content-between align-items-center mb-2">
-                                <small class="text-muted">Leverans: {{ order.shipping }}</small>
-                                <strong class="fs-5 text-dark">Totalt: {{ order.total }} SEK</strong>
+
+                            <!-- Récapitulatif financier et informations de livraison -->
+                            <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-3 bg-white p-2 rounded border">
+                                <div>
+                                    <small class="text-muted d-block">Leveransmetod: <strong>{{ order.shipping }}</strong></small>
+                                    {% if order.tracking_number %}
+                                        <small class="text-dark d-block mt-1"> <strong>Spårningsnummer:</strong> <code class="bg-light px-2 py-1 rounded">{{ order.tracking_number }}</code></small>
+                                    {% endif %}
+                                </div>
+                                <div class="text-end">
+                                    <small class="text-muted d-block">Totalt belopp:</small>
+                                    <strong class="fs-4 text-dark">{{ order.total }} SEK</strong>
+                                </div>
                             </div>
-                            {% if order.tracking_number %}
-                            <div class="alert alert-secondary p-2 mb-2 small border">
-                                📦 <strong>Spårningsnummer:</strong> <code>{{ order.tracking_number }}</code>
+
+                            <!-- Options de gestion : Retur -->
+                            {% if 'VIP' not in order.status and 'Mottagen' not in order.status %}
+                            <div class="d-flex gap-2">
+                                <button class="btn btn-outline-dark btn-sm" data-bs-toggle="collapse" data-bs-target="#returnForm{{ order.id }}">🔄 Begär Retur / Reklamation</button>
                             </div>
-                            {% endif %}
-                            <button class="btn btn-outline-dark btn-sm" data-bs-toggle="collapse" data-bs-target="#returnForm{{ order.id }}">🔄 Begär Retur</button>
-                            <div class="collapse mt-2" id="returnForm{{ order.id }}">
-                                <form action="/request_return/{{ order.id }}" method="POST" class="card card-body bg-white p-3">
-                                    <h6 class="mb-2">Begär Retur för Order #{{ order.id }}</h6>
+
+                            <!-- Formulaire repliable de retour -->
+                            <div class="collapse mt-3" id="returnForm{{ order.id }}">
+                                <form action="/request_return/{{ order.id }}" method="POST" class="card card-body bg-white p-3 border">
+                                    <h6 class="mb-2 fw-bold">Begär Retur för Order #{{ order.id }}</h6>
+                                    <p class="text-muted small mb-2">Välj vilken produkt du vill returnera och ange anledning.</p>
                                     <div class="mb-2">
-                                        <label class="form-label small">Välj produkt</label>
+                                        <label class="form-label small fw-bold">Välj produkt</label>
                                         <select class="form-select form-select-sm" name="item_name">
-                                            {% for item in order.order_items %}<option value="{{ item.name }}">{{ item.name }}</option>{% endfor %}
+                                            {% for item in order.order_items %}
+                                                <option value="{{ item.name }}">{{ item.name }} ({{ item.price }} SEK)</option>
+                                            {% endfor %}
                                         </select>
                                     </div>
-                                    <div class="mb-2"><label class="form-label small">Anledning</label><input type="text" class="form-control form-control-sm" name="reason" required placeholder="t.ex. Fel storlek"></div>
+                                    <div class="mb-3">
+                                        <label class="form-label small fw-bold">Anledning till retur</label>
+                                        <input type="text" class="form-control form-control-sm" name="reason" required placeholder="t.ex. Fel storlek, ångrat köp, etc.">
+                                    </div>
                                     <button type="submit" class="btn btn-dark btn-sm">Skicka Returbegäran</button>
                                 </form>
                             </div>
+                            {% endif %}
                         </div>
                         {% endfor %}
                     {% else %}
-                        <p class="text-muted">Du har inga tidigare beställningar ännu.</p>
+                        <div class="text-center py-5 bg-light rounded border">
+                            <p class="fs-5 text-muted mb-2">Du har inga tidigare beställningar ännu.</p>
+                            <a href="/#catalog-section" class="btn btn-dark btn-sm">Utforska Shoppen & Gör Din Första Beställning</a>
+                        </div>
                     {% endif %}
                 </div>
 
-                <div class="card p-4 shadow-sm bg-white">
+                <!-- Section Eventbiljetter & QR-koder (Inklusive Transfert, VIP & Wallet) -->
+                <div class="card p-4 shadow-sm bg-white border-0">
                     <h3 class="mb-3">🎫 Mina Eventbiljetter & QR-koder</h3>
-                    {% set has_tickets = false %}
+                    {% set has_tickets = namespace(value=false) %}
                     {% for order in orders %}
                         {% for item in order.order_items %}
                             {% if item.type == 'ticket' %}
-                                {% set has_tickets = true %}
-                                <div class="card mb-3 border-dark">
-                                    <div class="card-body d-flex justify-content-between align-items-center">
-                                        <div>
-                                            <h5 class="card-title text-dark mb-1">{{ item.name }}</h5>
-                                            <p class="text-muted small mb-0">Order ID: #{{ order.id }} | Köpt av: {{ current_user.name }}</p>
-                                            <span class="badge bg-secondary text-white mt-2">Giltig Biljett</span>
-                                            <div class="mt-3">
-                                                <a href="/download_ticket/{{ order.id }}/{{ item.name }}" class="btn btn-dark btn-sm">📄 Ladda ner PDF-biljett</a>
+                                {% set has_tickets.value = true %}
+                                {% set ticket_qr_data = item.ticket_code if item.ticket_code else 'TICKET-' ~ order.id ~ '-' ~ item.name %}
+                                <div class="card mb-3 border-dark bg-light shadow-sm">
+                                    <div class="card-body">
+                                        <div class="d-flex justify-content-between align-items-center flex-wrap gap-3">
+                                            <div>
+                                                <h5 class="card-title text-dark fw-bold mb-1">{{ item.name }}</h5>
+                                                <p class="text-muted small mb-1">Order ID: #{{ order.id }} | Gäst: {{ current_user.name }}</p>
+                                                {% if 'VIP' in order.status or 'VIP' in item.name %}
+                                                    <span class="badge bg-warning text-dark border border-dark">🌟 VIP-Pass / Inbjudan</span>
+                                                {% elif 'Mottagen' in order.status or 'Överförd' in item.name %}
+                                                    <span class="badge bg-info text-dark">🔄 Överförd Biljett</span>
+                                                {% else %}
+                                                    <span class="badge bg-dark text-white">Giltig Biljett</span>
+                                                {% endif %}
+                                                <div class="mt-3 d-flex flex-wrap gap-2">
+                                                    <a href="/download_ticket/{{ order.id }}/{{ item.name }}" class="btn btn-dark btn-sm fw-bold">📄 Ladda ner PDF-biljett</a>
+
+                                                    <!-- Bouton pour ouvrir le formulaire de transfert -->
+                                                    <button class="btn btn-outline-dark btn-sm fw-bold" data-bs-toggle="collapse" data-bs-target="#transferForm{{ order.id }}{{ loop.index }}">
+                                                        🔄 Överför till en vän
+                                                    </button>
+                                                </div>
+                                            </div>
+                                            <div class="text-center bg-white p-2 rounded border border-secondary shadow-sm">
+                                                <img src="https://api.qrserver.com/v1/create-qr-code/?size=110x110&data={{ ticket_qr_data }}" alt="QR Code" class="img-fluid" style="max-width: 110px;">
+                                                <small class="d-block text-dark fw-bold mt-1" style="font-size: 0.7rem;">Skanna i entrén</small>
                                             </div>
                                         </div>
-                                        <div class="text-center">
-                                            <img src="https://api.qrserver.com/v1/create-qr-code/?size=90x90&data=TICKET-{{ order.id }}-{{ item.name }}" alt="QR Code" class="img-thumbnail">
-                                            <small class="d-block text-muted mt-1" style="font-size: 0.7rem;">Skanna i entrén</small>
+
+                                        <!-- FORMULAIRE REPLIABLE DE TRANSFERT DE BILLET -->
+                                        <div class="collapse mt-3" id="transferForm{{ order.id }}{{ loop.index }}">
+                                            <form action="/transfer_ticket/{{ order.id }}/{{ item.name }}" method="POST" class="card card-body bg-white border border-dark p-3">
+                                                <h6 class="fw-bold mb-1 text-dark">🔄 Överför biljett till en vän</h6>
+                                                <p class="text-muted small mb-2">Ange e-postadressen till personen som ska få biljetten. Din nuvarande QR-kod kommer att spärras och en ny skickas till din vän.</p>
+                                                <div class="input-group input-group-sm mb-2">
+                                                    <input type="email" class="form-control" name="recipient_email" placeholder="van@example.com" required>
+                                                    <button type="submit" class="btn btn-dark fw-bold">Skicka Biljett 🚀</button>
+                                                </div>
+                                            </form>
+                                        </div>
+
+                                        <!-- SECTION DE SÉLECTION D'AJOUT AU WALLET SMARTPHONE -->
+                                        <div class="mt-3 pt-3 border-top d-flex flex-wrap gap-2 align-items-center">
+                                            <small class="text-muted fw-bold w-100 d-block mb-1">📱 Spara i din smartphone:</small>
+
+                                            <!-- Bouton Apple Wallet (iOS) -->
+                                            <a href="/download_apple_wallet/{{ order.id }}/{{ item.name }}" class="btn btn-dark btn-sm fw-bold d-inline-flex align-items-center gap-2 px-3 py-2 shadow-sm rounded-3">
+                                                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-apple" viewBox="0 0 16 16">
+                                                    <path d="M11.182.008C11.148-.03 9.923.023 8.857 1.18c-1.066 1.156-.902 2.482-.878 2.516.024.034 1.52.097 2.491-1.12.97-1.217.746-2.53.712-2.568zm.14 3.695c-.492 0-1.681.3-2.313.3-.728 0-1.895-.316-2.903-.316-2.181 0-4.008 1.481-4.008 4.28 0 3.018 2.22 6.551 4.148 6.551 1.05 0 1.637-.621 2.827-.621 1.176 0 1.698.621 2.808.621 1.884 0 3.993-3.328 3.993-6.52 0-.154-.011-.3-.027-.442-1.393-.615-2.203-2.133-2.203-3.64 0-1.464.795-2.532 2.148-3.088-.808-1.126-2.093-1.815-3.473-1.815z"/>
+                                                </svg>
+                                                <span>Apple Wallet</span>
+                                            </a>
+
+                                            <!-- Bouton Google Wallet (Android) -->
+                                            <a href="/add_google_wallet/{{ order.id }}/{{ item.name }}" target="_blank" class="btn btn-outline-dark btn-sm fw-bold d-inline-flex align-items-center gap-2 px-3 py-2 shadow-sm rounded-3 bg-white">
+                                                <img src="https://upload.wikimedia.org/wikipedia/commons/f/f2/Google_Pay_Logo.svg" alt="Google Pay" style="height: 16px;">
+                                                <span>Google Wallet</span>
+                                            </a>
                                         </div>
                                     </div>
                                 </div>
                             {% endif %}
                         {% endfor %}
                     {% endfor %}
-                    {% if not has_tickets %}
-                        <p class="text-muted mb-0">Du har inga aktiva eventbiljetter i ditt konto.</p>
+
+                    {% if not has_tickets.value %}
+                        <div class="text-center py-4 bg-light rounded border">
+                            <p class="text-muted mb-0">Du har inga aktiva eventbiljetter i ditt konto för tillfället.</p>
+                        </div>
                     {% endif %}
                 </div>
             </div>
@@ -1950,47 +2872,127 @@ ADMIN_DASHBOARD_TEMPLATE = """
     <style>
         .table-scroll-container { max-height: 400px; overflow-y: auto; border: 1px solid #dee2e6; border-radius: 0.375rem; }
         .table-scroll-container thead th { position: sticky; top: 0; background-color: #f8f9fa; z-index: 1; }
-        .admin-nav-sticky { position: sticky; top: 0; z-index: 1020; background-color: #111111; padding: 10px 0; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
-        .admin-nav-sticky .nav-link { color: #ffffff; font-weight: 500; font-size: 0.9rem; padding: 6px 12px; border-radius: 4px; transition: background 0.2s; }
-        .admin-nav-sticky .nav-link:hover, .admin-nav-sticky .nav-link.active { background-color: #ffffff; color: #000 !important; }
-        section { scroll-margin-top: 80px; }
+
+        /* Menu latéral coulissant en superposition (Overlay) */
+        .admin-sidebar {
+            height: 100%;
+            width: 0;
+            position: fixed;
+            z-index: 1060;
+            top: 0;
+            right: 0;
+            left: auto;
+            background-color: #111111;
+            overflow-x: hidden;
+            transition: 0.3s ease;
+            padding-top: 60px;
+            box-shadow: -5px 0 15px rgba(0,0,0,0.5);
+            display: flex;
+            flex-direction: column;
+        }
+
+        .sidebar-overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            background: rgba(0, 0, 0, 0.4);
+            z-index: 1050;
+        }
+        .sidebar-overlay.active {
+            display: block;
+        }
+
+        .admin-sidebar-content {
+            flex-grow: 1;
+            overflow-y: auto;
+        }
+        .admin-sidebar a {
+            padding: 12px 20px;
+            text-decoration: none;
+            font-size: 0.95rem;
+            color: #ffffff;
+            display: block;
+            transition: 0.2s;
+            border-right: 4px solid transparent;
+        }
+        .admin-sidebar a:hover, .admin-sidebar a.active {
+            background-color: #222222;
+            color: #ffc107;
+            border-right-color: #ffc107;
+        }
+        .admin-sidebar .close-btn {
+            position: absolute;
+            top: 15px;
+            left: 20px;
+            font-size: 24px;
+            cursor: pointer;
+            color: #fff;
+        }
+        .admin-sidebar-footer {
+            padding: 20px;
+            border-top: 1px solid #222222;
+        }
+        .admin-section { display: none; }
+        .admin-section.active-section { display: block; }
     </style>
 </head>
-<body class="bg-light">
-    <nav class="navbar navbar-dark bg-dark">
-        <div class="container">
-            <a class="navbar-brand text-white fw-bold d-flex align-items-center gap-2" href="/admin">
-                <img src="{{ logo_url }}" alt="Urban Nation Logo" style="height: 36px; width: 36px; border-radius: 50%;" onerror="this.style.display='none'">
-                <span>URBAN NATION <span class="text-light">Administration</span></span>
+<body class="bg-light text-dark">
+
+    <div id="sidebarOverlay" class="sidebar-overlay" onclick="closeNav()"></div>
+
+    <div id="adminSidebar" class="admin-sidebar">
+        <span class="close-btn" onclick="closeNav()">&times;</span>
+        <h4 class="text-white px-4 mb-4 fw-bold text-end">URBAN NATION <span class="text-warning fs-6">Admin</span></h4>
+
+        <div class="admin-sidebar-content">
+            <a href="#" onclick="showSection('stats'); return false;" class="menu-link active text-end">📊 Statistik</a>
+            <a href="#" onclick="showSection('categories'); return false;" class="menu-link text-end">🏷️ Kategorier</a>
+            <a href="#" onclick="showSection('orders'); return false;" class="menu-link text-end">🚚 Beställningar</a>
+            <a href="#" onclick="showSection('returns'); return false;" class="menu-link text-end">🔄 Returer</a>
+            <a href="#" onclick="showSection('promos'); return false;" class="menu-link text-end">🎟️ Rabattkoder</a>
+            <a href="#" onclick="showSection('events'); return false;" class="menu-link text-end">🎉 Event</a>
+            <a href="#" onclick="showSection('products'); return false;" class="menu-link text-end">📦 Produkter & Biljetter</a>
+            <a href="#" onclick="showSection('customers-section'); return false;" class="menu-link text-end">⚙️ Kunder och Inställningar</a>
+            <a href="#" onclick="showSection('vip-section'); return false;" class="menu-link text-end">🎁 VIP Inbjudan (Gratis Biljett)</a>
+            <a href="#" onclick="showSection('transfers-section'); return false;" class="menu-link text-end">🔄 Överföringsbegäran</a>
+            <a href="#" onclick="showSection('scanner-section'); return false;" class="menu-link text-end">📱 Ticket Scanner</a>
+            <a href="#" onclick="showSection('checkin-report-section'); return false;" class="menu-link text-end">⏲ Real-Time Check-in</a>
+            <a href="#" onclick="showSection('logs'); return false;" class="menu-link text-end">📋 Aktionslogg</a>
+        </div>
+
+        <div class="admin-sidebar-footer">
+            <a href="/admin/logout" class="btn btn-danger w-100 fw-bold text-center border-0 py-2">
+                🚪 Logga ut
             </a>
-            <div>
+        </div>
+    </div>
+
+    <nav class="navbar navbar-dark bg-dark">
+        <div class="container-fluid px-4">
+            <div class="d-flex align-items-center gap-3">
+                <a class="navbar-brand text-white fw-bold d-flex align-items-center gap-2" href="/admin">
+                    <img src="{{ logo_url }}" alt="Urban Nation Logo" style="height: 36px; width: 36px; border-radius: 50%;" onerror="this.style.display='none'">
+                    <span>URBAN NATION <span class="text-light">Administration</span></span>
+                </a>
+            </div>
+            <div class="d-flex align-items-center gap-2">
                 <a href="/" class="btn btn-outline-light btn-sm me-2">Visa Hemsida</a>
-                <a href="/admin/logout" class="btn btn-danger btn-sm">Logga ut</a>
+                <button class="btn btn-outline-warning btn-sm fw-bold" onclick="openNav()">
+                    ☰ Menu
+                </button>
             </div>
         </div>
     </nav>
 
-    <div class="admin-nav-sticky">
-        <div class="container">
-            <ul class="nav nav-pills justify-content-center gap-1 flex-wrap">
-                <li class="nav-item"><a class="nav-link" href="#stats">📊 Statistik</a></li>
-                <li class="nav-item"><a class="nav-link" href="#categories">🏷️ Kategorier</a></li>
-                <li class="nav-item"><a class="nav-link" href="#orders">🚚 Beställningar</a></li>
-                <li class="nav-item"><a class="nav-link" href="#returns">🔄 Returer</a></li>
-                <li class="nav-item"><a class="nav-link" href="#promos">🎟️ Rabattkoder</a></li>
-                <li class="nav-item"><a class="nav-link" href="#events">🎉 Event</a></li>
-                <li class="nav-item"><a class="nav-link" href="#products">📦 Produkter</a></li>
-                <li class="nav-item"><a class="nav-link" href="#logs">📋 Loggar</a></li>
-            </ul>
-        </div>
-    </div>
-
-    <div class="container my-5">
+    <div id="main-content" class="container my-5">
         {% with messages = get_flashed_messages(with_categories=true) %}
           {% if messages %}{% for c, m in messages %}<div class="alert alert-{{ c }}">{{ m }}</div>{% endfor %}{% endif %}
         {% endwith %}
 
-        <div class="d-flex justify-content-between align-items-center mb-4 bg-white p-3 rounded shadow-sm">
+        <div class="d-flex justify-content-between align-items-center mb-4 bg-white p-3 rounded shadow-sm border">
             <h4 class="mb-0">Exportera Data (Excel / CSV)</h4>
             <div class="d-flex gap-2">
                 <a href="/admin/export/orders" class="btn btn-dark btn-sm">Beställningar CSV</a>
@@ -1999,7 +3001,52 @@ ADMIN_DASHBOARD_TEMPLATE = """
             </div>
         </div>
 
-        <section id="stats" class="mb-5">
+        <div class="card p-4 shadow-sm mb-4 border-dark">
+            <div class="mb-3">
+                <h4 class="fw-bold mb-0">💰 Exporteringscenter & Bokföringsrapporter</h4>
+                <p class="text-muted small mb-0">Filtrera försäljning och momsunnderlag per månad eller år för bokföringen.</p>
+            </div>
+
+            <form action="/admin/sales_report_pdf" method="GET" target="_blank" class="row g-3 align-items-end">
+                <div class="col-md-3">
+                    <label class="form-label small fw-bold">Välj År (År)</label>
+                    <select class="form-select form-select-sm" name="year">
+                        <option value="">Alla år</option>
+                        <option value="2026" selected>2026</option>
+                        <option value="2025">2025</option>
+                    </select>
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label small fw-bold">Välj Månad</label>
+                    <select class="form-select form-select-sm" name="month">
+                        <option value="">Alla månader (Helår)</option>
+                        <option value="01">Januari (01)</option>
+                        <option value="02">Februari (02)</option>
+                        <option value="03">Mars (03)</option>
+                        <option value="04">April (04)</option>
+                        <option value="05">Maj (05)</option>
+                        <option value="06">Juni (06)</option>
+                        <option value="07">Juli (07)</option>
+                        <option value="08">Augusti (08)</option>
+                        <option value="09">September (09)</option>
+                        <option value="10" selected>Oktober (10)</option>
+                        <option value="11">November (11)</option>
+                        <option value="12">December (12)</option>
+                    </select>
+                </div>
+                <div class="col-md-6 d-flex gap-2">
+                    <button type="submit" class="btn btn-dark btn-sm fw-bold w-50">
+                        📄 Visa PDF-rapport
+                    </button>
+                    <button type="button" class="btn btn-outline-success btn-sm fw-bold w-50" onclick="exportFilteredCSV()">
+                        📊 Ladda ner CSV
+                    </button>
+                </div>
+            </form>
+        </div>
+
+        <!-- SECTION 1: STATISTIK -->
+        <section id="stats" class="admin-section active-section mb-5">
             <div class="d-flex justify-content-between align-items-center mb-3">
                 <h3 class="mb-0">Försäljningsstatistik & Analys</h3>
                 <button class="btn btn-dark btn-sm" data-bs-toggle="modal" data-bs-target="#editStatsModal">⚙️ Ändra statistik</button>
@@ -2046,7 +3093,8 @@ ADMIN_DASHBOARD_TEMPLATE = """
             </div>
         </section>
 
-        <section id="categories" class="card p-4 shadow-sm mb-5">
+        <!-- SECTION 2: KATEGORIER -->
+        <section id="categories" class="admin-section card p-4 shadow-sm mb-5">
             <h3 class="mb-3">Hantera Produkttyper / Kategori</h3>
             <form action="/admin/add_type" method="POST" class="row g-3 mb-4">
                 <div class="col-auto"><input type="text" class="form-control" name="type_name" required placeholder="Nytt typnamn"></div>
@@ -2065,7 +3113,8 @@ ADMIN_DASHBOARD_TEMPLATE = """
             </ul>
         </section>
 
-        <section id="orders" class="card p-4 shadow-sm mb-5">
+        <!-- SECTION 3: BESTÄLLNINGAR -->
+        <section id="orders" class="admin-section card p-4 shadow-sm mb-5">
             <h3 class="mb-3">Hantera Beställningar</h3>
             <div class="table-scroll-container">
                 <table class="table table-striped align-middle mb-0">
@@ -2109,7 +3158,8 @@ ADMIN_DASHBOARD_TEMPLATE = """
             </div>
         </section>
 
-        <section id="returns" class="card p-4 shadow-sm mb-5">
+        <!-- SECTION 4: RETURER -->
+        <section id="returns" class="admin-section card p-4 shadow-sm mb-5">
             <h3 class="mb-3">Hantera Returer</h3>
             {% if returns %}
             <div class="table-scroll-container">
@@ -2135,10 +3185,10 @@ ADMIN_DASHBOARD_TEMPLATE = """
             {% else %}<p class="text-muted mb-0">Inga returer.</p>{% endif %}
         </section>
 
-        <section id="promos" class="card p-4 shadow-sm mb-5">
+        <!-- SECTION 5: RABATTKODER -->
+        <section id="promos" class="admin-section card p-4 shadow-sm mb-5">
             <h3 class="mb-3">Hantera Rabattkoder & Kampanjbrickor (Rea / Black Friday)</h3>
-            
-            <!-- Section 1 : Rabattkoder i kassan -->
+
             <h5 class="mt-2 mb-3 text-muted">1. Rabattkoder (Används i kassan)</h5>
             <form action="/admin/add_promo" method="POST" class="row g-3 mb-4">
                 <div class="col-auto"><input type="text" class="form-control" name="code" required placeholder="Kod (t.ex. URBAN)"></div>
@@ -2156,7 +3206,6 @@ ADMIN_DASHBOARD_TEMPLATE = """
 
             <hr class="my-4">
 
-            <!-- Section 2 : Koppla Kampanjbricka / Rea till valt produkt -->
             <h5 class="mb-3 text-muted">2. Lägg till eller ändra Kampanjbricka & Rea på en produkt</h5>
             <form action="/admin/assign_promo_badge" method="POST" class="row g-3 mb-4 bg-light p-3 rounded border">
                 <div class="col-md-5">
@@ -2179,10 +3228,9 @@ ADMIN_DASHBOARD_TEMPLATE = """
                     <button type="submit" class="btn btn-dark w-100">Spara på produkt</button>
                 </div>
             </form>
-            
+
             <hr class="my-4">
 
-            <!-- Section 3 : Aktiva Kampanjbrickor lista -->
             <h5 class="mb-3 text-muted">3. Aktiva Kampanjbrickor på produkter</h5>
             <ul class="list-group">
                 {% set ns = namespace(has_badges=false) %}
@@ -2205,48 +3253,205 @@ ADMIN_DASHBOARD_TEMPLATE = """
             </ul>
         </section>
 
-        <section id="events" class="card p-4 shadow-sm mb-5">
+        <!-- SECTION 6: EVENT & BILJETTYPER -->
+        <section id="events" class="admin-section card p-4 shadow-sm mb-5">
+        
+            <!-- FORMULAIRE INDÉPENDANT POUR LE MESSAGE D'ANNONCE "EN PRÉPARATION" -->
+            <div class="mb-4 bg-warning bg-opacity-10 p-3 rounded border border-warning">
+                <form action="/admin/update_announcement" method="POST" enctype="multipart/form-data">
+                    <div class="d-flex justify-content-between align-items-center mb-3">
+                        <h5 class="text-dark fw-bold mb-0">🚧 Globalt "Under förberedelse"-meddelande</h5>
+                        <!-- Bouton pour supprimer/effacer l'annonce -->
+                        <a href="/admin/delete_announcement" class="btn btn-outline-danger btn-sm fw-bold" onclick="return confirm('Vill du ta bort detta meddelande?')">🗑️ Radera meddelande</a>
+                    </div>
+                    
+                    <div class="form-check mb-3">
+                        <input class="form-check-input" type="checkbox" name="announcement_active" id="checkAnnouncement" {% if global_announcement and global_announcement.active %}checked{% endif %}>
+                        <label class="form-check-label fw-bold text-dark" for="checkAnnouncement">
+                            Aktivera meddelande för hemsidan
+                        </label>
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label class="form-label small fw-bold">Meddelande till användare</label>
+                        <textarea class="form-control" name="announcement_text" rows="2" placeholder="t.ex. Line-up och hemlig lokal släpps om några dagar...">{{ global_announcement.text if global_announcement else '' }}</textarea>
+                    </div>
+            
+                    <div class="row align-items-center mb-3">
+                        <div class="col-md-9">
+                            <label class="form-label small fw-bold">Bild för förberedelse-meddelandet (valfritt)</label>
+                            <input type="file" class="form-control form-control-sm" name="announcement_file" accept="image/*">
+                        </div>
+                        <div class="col-md-3 text-end">
+                            <button type="submit" class="btn btn-warning fw-bold text-dark w-100 mt-4">💾 Spara meddelande</button>
+                        </div>
+                    </div>
+                </form>
+            </div>
+        
             <h3 class="mb-3">Publicera nytt Evenemang</h3>
             <form action="/admin/add_event" method="POST" enctype="multipart/form-data">
                 <div class="row">
-                    <div class="col-md-6 mb-3"><label class="form-label">Titel</label><input type="text" class="form-control" name="title" required></div>
+                    <div class="col-md-4 mb-3"><label class="form-label">Titel</label><input type="text" class="form-control" name="title" required></div>
                     <div class="col-md-3 mb-3"><label class="form-label">Datum</label><input type="date" class="form-control" name="date" required></div>
-                    <div class="col-md-3 mb-3"><label class="form-label">Tid</label><input type="text" class="form-control" name="time" required placeholder="23:00 - 05:00"></div>
+                    <div class="col-md-3 mb-3"><label class="form-label">Tid</label><input type="text" class="form-control" name="time" required value="23:00 - 05:00"></div>
+                    <div class="col-md-2 mb-3"><label class="form-label fw-bold">Åldersgräns</label><input type="number" class="form-control" name="min_age" value="18" required></div>
                 </div>
-                <div class="row">
-                    <div class="col-md-6 mb-3"><label class="form-label">Plats</label><input type="text" class="form-control" name="location" required></div>
-                    <div class="col-md-6 mb-3"><label class="form-label">Pris (SEK)</label><input type="number" class="form-control" name="price" required></div>
+                
+                <div class="row mb-3">
+                    <div class="col-md-6"><label class="form-label">Plats</label><input type="text" class="form-control" name="location" required placeholder="t.ex. Stockholm Club Central"></div>
+                    <div class="col-md-6"><label class="form-label">Baspris Standard (SEK)</label><input type="number" class="form-control" name="price" required value="250"></div>
                 </div>
+        
+                <!-- SÉLECTION DES BILJETTYPES PAR CASES À COCHER (CHECKBOXES) -->
+                <div class="mb-4 bg-light p-3 rounded border">
+                    <label class="form-label fw-bold mb-2">🏷️ Välj biljettyper och zoner som ska aktiveras för detta event:</label>
+                    
+                    <div class="row g-3">
+                        <div class="col-md-4">
+                            <div class="p-3 border bg-white rounded shadow-sm">
+                                <div class="form-check mb-2">
+                                    <input class="form-check-input" type="checkbox" name="ticket_types" value="Early Bird" id="checkEarlyBird" checked>
+                                    <label class="form-check-label fw-bold" for="checkEarlyBird">Early Bird</label>
+                                </div>
+                                <div class="mb-2"><label class="form-label small text-muted">Pris (SEK)</label><input type="number" class="form-control form-control-sm" name="price_early_bird" value="200"></div>
+                                <div><label class="form-label small text-muted">Antal platser</label><input type="number" class="form-control form-control-sm" name="stock_early_bird" value="50"></div>
+                            </div>
+                        </div>
+        
+                        <div class="col-md-4">
+                            <div class="p-3 border bg-white rounded shadow-sm">
+                                <div class="form-check mb-2">
+                                    <input class="form-check-input" type="checkbox" name="ticket_types" value="Standard" id="checkStandard" checked>
+                                    <label class="form-check-label fw-bold" for="checkStandard">Standard</label>
+                                </div>
+                                <div class="mb-2"><label class="form-label small text-muted">Pris (SEK)</label><input type="number" class="form-control form-control-sm" name="price_standard" value="250"></div>
+                                <div><label class="form-label small text-muted">Antal platser</label><input type="number" class="form-control form-control-sm" name="stock_standard" value="150"></div>
+                            </div>
+                        </div>
+        
+                        <div class="col-md-4">
+                            <div class="p-3 border bg-white rounded shadow-sm">
+                                <div class="form-check mb-2">
+                                    <input class="form-check-input" type="checkbox" name="ticket_types" value="VIP / Fast Track" id="checkVip" checked>
+                                    <label class="form-check-label fw-bold" for="checkVip">VIP / Fast Track</label>
+                                </div>
+                                <div class="mb-2"><label class="form-label small text-muted">Pris (SEK)</label><input type="number" class="form-control form-control-sm" name="price_vip" value="375"></div>
+                                <div><label class="form-label small text-muted">Antal platser</label><input type="number" class="form-control form-control-sm" name="stock_vip" value="40"></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+        
                 <div class="row mb-3">
                     <div class="col-md-6"><label class="form-label">📁 Bildfil</label><input type="file" class="form-control" name="image_file" accept="image/*"></div>
                     <div class="col-md-6"><label class="form-label">🔗 Bild-URL</label><input type="text" class="form-control" name="image_url"></div>
                 </div>
-                <div class="mb-3"><label class="form-label">Beskrivning</label><textarea class="form-control" name="desc" rows="2"></textarea></div>
-                <button type="submit" class="btn btn-dark">Publicera Event</button>
+                <div class="mb-3"><label class="form-label">Beskrivning</label><textarea class="form-control" name="desc" rows="2" placeholder="Kort beskrivning..."></textarea></div>
+                <button type="submit" class="btn btn-dark fw-bold">🚀 Publicera Event & Zoner</button>
             </form>
+        
+            <hr class="my-4">
+        
+            <!-- LISTE DES ÉVÉNEMENTS EXISTANTS -->
+            <h4 class="mb-3">Befintliga Evenemang</h4>
+            <div class="table-scroll-container mb-3">
+                <table class="table table-striped align-middle mb-0">
+                    <thead>
+                        <tr>
+                            <th>Bild</th>
+                            <th>Titel</th>
+                            <th>Datum & Tid</th>
+                            <th>Plats</th>
+                            <th>Ålder</th>
+                            <th>Åtgärd</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% if events %}
+                            {% for event in events %}
+                            <tr>
+                                <td><img src="{{ event.image }}" style="width: 45px; height: 45px; object-fit: cover; border-radius: 6px;"></td>
+                                <td><strong>{{ event.title }}</strong></td>
+                                <td><small>{{ event.date }} ({{ event.time }})</small></td>
+                                <td><small>{{ event.location }}</small></td>
+                                <td><span class="badge bg-secondary">{{ event.min_age if event.min_age else 18 }} år</span></td>
+                                <td>
+                                    <div class="d-flex gap-1">
+                                        <button class="btn btn-outline-dark btn-sm" data-bs-toggle="modal" data-bs-target="#editEventModal{{ event.id }}">✏️ Ändra</button>
+                                        <a href="/admin/delete_event/{{ event.id }}" class="btn btn-danger btn-sm" onclick="return confirm('Vill du ta bort detta event?')">🗑️ Ta bort</a>
+                                    </div>
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        {% else %}
+                            <tr><td colspan="6" class="text-center text-muted py-3">Inga evenemang publicerade ännu.</td></tr>
+                        {% endif %}
+                    </tbody>
+                </table>
+            </div>
+        
+            <!-- MODAUX HORS DU TABLEAU BASÉS SUR event.id -->
+            {% if events %}
+                {% for event in events %}
+                <div class="modal fade" id="editEventModal{{ event.id }}" tabindex="-1">
+                  <div class="modal-dialog modal-lg"><div class="modal-content">
+                    <form action="/admin/edit_event/{{ event.id }}" method="POST">
+                        <div class="modal-header bg-dark text-white">
+                            <h5 class="modal-title">Redigera Event: {{ event.title }}</h5>
+                            <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                        </div>
+                        <div class="modal-body">
+                            <div class="row mb-3">
+                                <div class="col-md-6"><label class="form-label small fw-bold">Titel</label><input type="text" class="form-control" name="title" value="{{ event.title }}" required></div>
+                                <div class="col-md-3 mb-3"><label class="form-label small fw-bold">Datum</label><input type="date" class="form-control" name="date" value="{{ event.date }}" required></div>
+                                <div class="col-md-3 mb-3"><label class="form-label small fw-bold">Tid</label><input type="text" class="form-control" name="time" value="{{ event.time }}" required></div>
+                            </div>
+                            <div class="row mb-3">
+                                <div class="col-md-6"><label class="form-label small fw-bold">Plats</label><input type="text" class="form-control" name="location" value="{{ event.location }}" required></div>
+                                <div class="col-md-6"><label class="form-label small fw-bold">Åldersgräns</label><input type="number" class="form-control" name="min_age" value="{{ event.min_age if event.min_age else 18 }}" required></div>
+                            </div>
+                            <div class="mb-3"><label class="form-label small fw-bold">Beskrivning</label><textarea class="form-control" name="desc" rows="2">{{ event.desc }}</textarea></div>
+                        </div>
+                        <div class="modal-footer">
+                            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Avbryt</button>
+                            <button type="submit" class="btn btn-dark">Spara ändringar</button>
+                        </div>
+                    </form>
+                  </div></div>
+                </div>
+                {% endfor %}
+            {% endif %}
         </section>
 
-        <section id="products" class="mb-5">
+        <!-- SECTION 7: PRODUKTER & BILJETTER -->
+        <section id="products" class="admin-section mb-5">
             <div class="card p-4 shadow-sm mb-4">
                 <h3 class="mb-3">Lägg till ny produkt / Biljett</h3>
                 <form action="/admin/add_product" method="POST" enctype="multipart/form-data">
                     <div class="row mb-3">
-                        <div class="col-md-4"><label class="form-label">Namn</label><input type="text" class="form-control" name="name" required placeholder="Produktnamn"></div>
+                        <div class="col-md-4"><label class="form-label">Namn</label><input type="text" class="form-control" name="name" required placeholder="Produktnamn eller Biljettnamn"></div>
                         <div class="col-md-2"><label class="form-label">Ord. Pris (SEK)</label><input type="number" class="form-control" name="price" required placeholder="699"></div>
-                        <div class="col-md-2"><label class="form-label">Typ / Kategori</label>
+                        <div class="col-md-3"><label class="form-label">Typ / Kategori</label>
                             <select class="form-select" name="type">
                                 {% for t in product_types %}<option value="{{ t.id }}">{{ t.name }}</option>{% endfor %}
                             </select>
                         </div>
+                        <div class="col-md-3"><label class="form-label">Lagerantal (Stock)</label><input type="number" class="form-control" name="total_stock" value="50" required></div>
                     </div>
+
                     <div class="row mb-3">
-                        <div class="col-md-2"><label class="form-label">Lagerantal (Stock)</label><input type="number" class="form-control" name="total_stock" value="50" required></div>
-                        <div class="col-md-3"><label class="form-label">Storlekar (Komma-separerade)</label><input type="text" class="form-control" name="sizes" placeholder="S, M, L, XL,..."></div>
-                        <div class="col-md-3"><label class="form-label">Färger (Komma-separerade)</label><input type="text" class="form-control" name="colors" placeholder="Svart, Vit"></div>
-                        <div class="col-md-4"><label class="form-label">Bild URL</label><input type="text" class="form-control" name="image_url" placeholder="https://..."></div>
+                        <div class="col-md-4"><label class="form-label">Storlekar (Komma-separerade)</label><input type="text" class="form-control" name="sizes" placeholder="S, M, L, XL,..."></div>
+                        <div class="col-md-4"><label class="form-label">Färger (Komma-separerade)</label><input type="text" class="form-control" name="colors" placeholder="Svart, Vit"></div>
+                        <div class="col-md-4"><label class="form-label">📁 Ladda upp bildfil</label><input type="file" class="form-control" name="image_file" accept="image/*"></div>
                     </div>
-                    <div class="mb-3"><label class="form-label">Beskrivning</label><textarea class="form-control" name="desc" rows="2" placeholder="Kort beskrivning av produkten..."></textarea></div>
-                    <button type="submit" class="btn btn-dark">Lägg till produkt</button>
+
+                    <div class="row mb-3">
+                        <div class="col-md-12"><label class="form-label">🔗 Eller Bild-URL</label><input type="text" class="form-control" name="image_url" placeholder="https://..."></div>
+                    </div>
+
+                    <div class="mb-3"><label class="form-label">Beskrivning</label><textarea class="form-control" name="desc" rows="2" placeholder="Kort beskrivning..."></textarea></div>
+                    <button type="submit" class="btn btn-dark">Lägg till produkt / Biljett</button>
                 </form>
             </div>
 
@@ -2284,7 +3489,402 @@ ADMIN_DASHBOARD_TEMPLATE = """
             </div>
         </section>
 
-        <section id="logs" class="mb-5">
+        <!-- SECTION 8: VIP INBJUDAN -->
+        <section id="vip-section" class="admin-section card p-4 shadow-sm mb-5 border-dark">
+            <div class="d-flex justify-content-between align-items-center mb-3">
+                <div>
+                    <h3 class="mb-0">🎁 Utfärda VIP Inbjudan (Gratis Biljett)</h3>
+                    <p class="text-muted small mb-0">Biljetten placeras direkt i gästens konto på webbplatsen för att driva trafik till shoppen.</p>
+                </div>
+            </div>
+
+            <form action="/admin/issue_vip_ticket" method="POST" class="row g-3 align-items-end">
+                <div class="col-md-3">
+                    <label class="form-label small fw-bold">Gästens Namn</label>
+                    <input type="text" class="form-control" name="guest_name" required placeholder="t.ex. Alex Lindqvist">
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label small fw-bold">E-postadress</label>
+                    <input type="email" class="form-control" name="guest_email" required placeholder="alex@example.com">
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label small fw-bold">Välj Evenemang</label>
+                    <select class="form-select" name="event_name">
+                        {% for e in events %}
+                        <option value="{{ e.title }}">{{ e.title }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="col-md-3">
+                    <button type="submit" class="btn btn-dark w-100 fw-bold">🚀 Skicka VIP-inbjudan</button>
+                </div>
+            </form>
+        </section>
+
+        <!-- SECTION 9: ÖVERFÖRINGSBEGÄRAN -->
+        <section id="transfers-section" class="admin-section card p-4 shadow-sm mb-5 border-dark">
+            <div class="d-flex justify-content-between align-items-center mb-3">
+                <div>
+                    <h3 class="mb-0">🔄 Överföringsbegäran av biljetter (Säkerhetskontroll)</h3>
+                    <p class="text-muted small mb-0">Granska och godkänn biljettoverföringar för att förhindra andrahandsförsäljning och bedrägerier.</p>
+                </div>
+            </div>
+
+            <div class="table-responsive">
+                <table class="table table-sm table-striped align-middle">
+                    <thead class="table-dark">
+                        <tr>
+                            <th>Begäran ID</th>
+                            <th>Datum</th>
+                            <th>Avsändare (Från)</th>
+                            <th>Mottagare (Till)</th>
+                            <th>Biljett</th>
+                            <th>Status</th>
+                            <th class="text-end">Åtgärd</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% if pending_transfers %}
+                            {% for req in pending_transfers %}
+                            <tr>
+                                <td><code>#{{ req.id }}</code></td>
+                                <td><small>{{ req.request_date }}</small></td>
+                                <td><strong>{{ req.sender_name }}</strong><br><small class="text-muted">{{ req.sender_email }}</small></td>
+                                <td><span class="badge bg-light text-dark border">{{ req.recipient_email }}</span></td>
+                                <td><strong>{{ req.ticket_name }}</strong></td>
+                                <td>
+                                    {% if req.status == 'PENDING' %}
+                                        <span class="badge bg-warning text-dark">⏳ Väntar på godkännande</span>
+                                    {% elif req.status == 'APPROVED' %}
+                                        <span class="badge bg-success">✅ Godkänd</span>
+                                    {% else %}
+                                        <span class="badge bg-danger">❌ Avslagen</span>
+                                    {% endif %}
+                                </td>
+                                <td class="text-end">
+                                    {% if req.status == 'PENDING' %}
+                                    <div class="d-flex gap-1 justify-content-end">
+                                        <form action="/admin/process_transfer/{{ req.id }}/approve" method="POST">
+                                            <button type="submit" class="btn btn-success btn-sm fw-bold">Godkänn ✅</button>
+                                        </form>
+                                        <form action="/admin/process_transfer/{{ req.id }}/reject" method="POST">
+                                            <button type="submit" class="btn btn-outline-danger btn-sm fw-bold">Avslå ❌</button>
+                                        </form>
+                                    </div>
+                                    {% else %}
+                                        <small class="text-muted">Hanterad</small>
+                                    {% endif %}
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        {% else %}
+                            <tr>
+                                <td colspan="7" class="text-center text-muted py-3">Inga överföringsbegäranden att granska för tillfället.</td>
+                            </tr>
+                        {% endif %}
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <!-- SECTION 10: KUNDHANTERING -->
+        <section id="customers-section" class="admin-section card p-4 shadow-sm mb-5">
+            <div class="d-flex justify-content-between align-items-center mb-3">
+                <h3 class="mb-0">👥 Kundhantering & Inloggningsstatistik</h3>
+                <span class="badge bg-dark fs-6">{{ customers|length }} Registrerade Kunder</span>
+            </div>
+
+            {% set ns = namespace(google=0, apple=0, facebook=0, instagram=0, tiktok=0, email=0) %}
+            {% for c in customers %}
+                {% set provider = c.provider if c.provider else 'email' %}
+                {% if provider == 'google' %}{% set ns.google = ns.google + 1 %}
+                {% elif provider == 'apple' %}{% set ns.apple = ns.apple + 1 %}
+                {% elif provider == 'facebook' %}{% set ns.facebook = ns.facebook + 1 %}
+                {% elif provider == 'instagram' %}{% set ns.instagram = ns.instagram + 1 %}
+                {% elif provider == 'tiktok' %}{% set ns.tiktok = ns.tiktok + 1 %}
+                {% else %}{% set ns.email = ns.email + 1 %}
+                {% endif %}
+            {% endfor %}
+
+            <div class="row my-3">
+                <div class="col-md-8">
+                    <div class="row g-2">
+                        <div class="col-6 col-md-4">
+                            <div class="p-3 border rounded text-center bg-light">
+                                <small class="text-muted d-block">Google</small>
+                                <strong class="fs-4 text-dark">{{ ns.google }}</strong>
+                            </div>
+                        </div>
+                        <div class="col-6 col-md-4">
+                            <div class="p-3 border rounded text-center bg-light">
+                                <small class="text-muted d-block">Apple</small>
+                                <strong class="fs-4 text-dark">{{ ns.apple }}</strong>
+                            </div>
+                        </div>
+                        <div class="col-6 col-md-4">
+                            <div class="p-3 border rounded text-center bg-light">
+                                <small class="text-muted d-block">Facebook</small>
+                                <strong class="fs-4 text-primary">{{ ns.facebook }}</strong>
+                            </div>
+                        </div>
+                        <div class="col-6 col-md-4">
+                            <div class="p-3 border rounded text-center bg-light">
+                                <small class="text-muted d-block">Instagram</small>
+                                <strong class="fs-4 text-dark">{{ ns.instagram }}</strong>
+                            </div>
+                        </div>
+                        <div class="col-6 col-md-4">
+                            <div class="p-3 border rounded text-center bg-light">
+                                <small class="text-muted d-block">TikTok</small>
+                                <strong class="fs-4 text-dark">{{ ns.tiktok }}</strong>
+                            </div>
+                        </div>
+                        <div class="col-6 col-md-4">
+                            <div class="p-3 border rounded text-center bg-light">
+                                <small class="text-muted d-block">E-post</small>
+                                <strong class="fs-4 text-secondary">{{ ns.email }}</strong>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="col-md-4 d-flex align-items-center justify-content-center">
+                    <div style="width: 100%; max-width: 220px;">
+                        <canvas id="loginProvidersChart"></canvas>
+                    </div>
+                </div>
+            </div>
+
+            <hr class="my-4">
+
+            <div class="table-scroll-container">
+                <table class="table table-striped align-middle mb-0">
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>Namn</th>
+                            <th>E-post</th>
+                            <th>Inloggningsmetod</th>
+                            <th>Telefon</th>
+                            <th>Ort</th>
+                            <th>Orderantal</th>
+                            <th>Åtgärd</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for c in customers %}
+                        <tr>
+                            <td><strong>#{{ c.id }}</strong></td>
+                            <td><strong>{{ c.name }}</strong></td>
+                            <td>{{ c.email }}</td>
+                            <td>
+                                {% set provider = c.provider if c.provider else 'email' %}
+                                {% if provider == 'google' %}
+                                    <span class="badge bg-danger text-white">Google</span>
+                                {% elif provider == 'apple' %}
+                                    <span class="badge bg-dark text-white">Apple</span>
+                                {% elif provider == 'facebook' %}
+                                    <span class="badge bg-primary text-white">Facebook</span>
+                                {% elif provider == 'instagram' %}
+                                    <span class="badge bg-secondary text-white">Instagram</span>
+                                {% elif provider == 'tiktok' %}
+                                    <span class="badge bg-dark text-white">TikTok</span>
+                                {% else %}
+                                    <span class="badge bg-secondary text-white">E-post & Lösenord</span>
+                                {% endif %}
+                            </td>
+                            <td><small>{{ c.phone if c.phone else '-' }}</small></td>
+                            <td><small>{{ c.city if c.city else '-' }}</small></td>
+                            <td><span class="badge bg-dark">{{ c.total_orders if c.total_orders else 0 }} st</span></td>
+                            <td>
+                                <button class="btn btn-outline-dark btn-sm" data-bs-toggle="modal" data-bs-target="#editCustomerModal{{ c.id }}">✏️ Redigera</button>
+                            </td>
+                        </tr>
+
+                        <div class="modal fade" id="editCustomerModal{{ c.id }}" tabindex="-1">
+                            <div class="modal-dialog modal-lg">
+                                <div class="modal-content">
+                                    <form action="/admin/customer/update/{{ c.id }}" method="POST">
+                                        <div class="modal-header bg-dark text-white">
+                                            <h5 class="modal-title">Redigera Kund #{{ c.id }} - {{ c.name }}</h5>
+                                            <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                                        </div>
+                                        <div class="modal-body">
+                                            <div class="row mb-3">
+                                                <div class="col-md-6">
+                                                    <label class="form-label small fw-bold">Förnamn</label>
+                                                    <input type="text" class="form-control" name="first_name" value="{{ c.first_name if c.first_name else c.name.split()[0] }}" required>
+                                                </div>
+                                                <div class="col-md-6">
+                                                    <label class="form-label small fw-bold">Efternamn</label>
+                                                    <input type="text" class="form-control" name="last_name" value="{{ c.last_name if c.last_name else ' '.join(c.name.split()[1:]) }}">
+                                                </div>
+                                            </div>
+                                            <div class="row mb-3">
+                                                <div class="col-md-6">
+                                                    <label class="form-label small fw-bold">E-postadress</label>
+                                                    <input type="email" class="form-control" name="email" value="{{ c.email }}" required>
+                                                </div>
+                                                <div class="col-md-6">
+                                                    <label class="form-label small fw-bold">Telefonnummer</label>
+                                                    <input type="text" class="form-control" name="phone" value="{{ c.phone if c.phone else '' }}">
+                                                </div>
+                                            </div>
+                                            <div class="mb-3">
+                                                <label class="form-label small fw-bold">Gatuadress</label>
+                                                <input type="text" class="form-control" name="address" value="{{ c.address if c.address else '' }}">
+                                            </div>
+                                            <div class="row mb-3">
+                                                <div class="col-md-6">
+                                                    <label class="form-label small fw-bold">Postnummer</label>
+                                                    <input type="text" class="form-control" name="postal_code" value="{{ c.postal_code if c.postal_code else '' }}">
+                                                </div>
+                                                <div class="col-md-6">
+                                                    <label class="form-label small fw-bold">Stad</label>
+                                                    <input type="text" class="form-control" name="city" value="{{ c.city if c.city else '' }}">
+                                                </div>
+                                            </div>
+                                        </div>
+                                        <div class="modal-footer">
+                                            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Avbryt</button>
+                                            <button type="submit" class="btn btn-dark">Spara ändringar</button>
+                                        </div>
+                                    </form>
+                                </div>
+                            </div>
+                        </div>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <!-- SECTION 11: TICKET SCANNER -->
+        <section id="scanner-section" class="admin-section card p-4 shadow-sm mb-5 border-dark">
+            <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+                <div>
+                    <h3 class="mb-0">📱 URBAN NATION - Ticket Scanner</h3>
+                    <p class="text-muted small mb-0">Skapa tidsbegränsade länkar (max 6h) för ordningsvakter och personal i entrén.</p>
+                </div>
+                <form action="/admin/generate_scanner_link" method="POST">
+                    <button type="submit" class="btn btn-dark fw-bold">🔗 Generera ny Scanner-länk (6h)</button>
+                </form>
+            </div>
+
+            <div class="table-responsive mb-4">
+                <table class="table table-sm table-striped align-middle">
+                    <thead>
+                        <tr>
+                            <th>Token ID</th>
+                            <th>Lösenord</th>
+                            <th>Giltig till</th>
+                            <th>Direktlänk för personal</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% if scanner_tokens %}
+                            {% for token, data in scanner_tokens.items() %}
+                            <tr>
+                                <td><code>{{ token }}</code></td>
+                                <td><span class="badge bg-secondary fs-6">{{ data.password }}</span></td>
+                                <td><small class="fw-bold">{{ data.expires_formatted }}</small></td>
+                                <td>
+                                    <a href="/scanner/{{ token }}" target="_blank" class="btn btn-warning btn-sm fw-bold">
+                                        🔗 Öppna Skanner-sida ↗
+                                    </a>
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        {% else %}
+                            <tr>
+                                <td colspan="4" class="text-center text-muted py-3">
+                                    Inga aktiva scanner-länkar för tillfället. Klicka på knappen ovan för att skapa en.
+                                </td>
+                            </tr>
+                        {% endif %}
+                    </tbody>
+                </table>
+            </div>
+
+            <hr class="my-4">
+
+            <div class="row justify-content-center">
+                <div class="col-md-6 text-center">
+                    <h5 class="fw-bold mb-2">Live Biljettskanner (Admin-vy)</h5>
+                    <p class="text-muted small">Verifiera besökarens ID-kort och ålder innan godkännande.</p>
+
+                    <div class="d-flex justify-content-center gap-2 mb-3">
+                        <button id="toggleCameraBtn" class="btn btn-dark btn-sm" onclick="toggleCamera()">📷 Stäng av kamera</button>
+                        <button id="toggleFlashBtn" class="btn btn-outline-dark btn-sm" onclick="toggleFlash()" disabled>⚡ Flash (Ficklampa)</button>
+                    </div>
+
+                    <div id="scanner-container" class="border rounded bg-black mb-3 position-relative shadow-sm overflow-hidden" style="height: 280px;">
+                        <video id="preview" style="width: 100%; height: 100%; object-fit: cover;"></video>
+                    </div>
+
+                    <div id="scan-result" class="alert d-none text-start"></div>
+                </div>
+            </div>
+        </section>
+
+        <!-- SECTION 12: REAL-TIME CHECK-IN -->
+        <section id="checkin-report-section" class="admin-section card p-4 shadow-sm mb-5 border-dark">
+            <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+                <div>
+                    <h3 class="mb-0">📊 Real-Time Check-in</h3>
+                    <p class="text-muted small mb-0">Övervaka antal insläppta besökare och tidpunkter för köbildning i entrén.</p>
+                    <small id="adminLocalTime" class="text-primary fw-bold d-block mt-1">🕒 Datum & Tid: Laddar...</small>
+                </div>
+
+                <div class="d-flex align-items-center gap-3 flex-wrap">
+                    <div>
+                        <label class="form-label small fw-bold mb-1 d-block">Välj Evenemang</label>
+                        {% set grand_total_tickets = namespace(count=0) %}
+                        {% for e in events %}{% set grand_total_tickets.count = grand_total_tickets.count + (e.total_tickets if e.total_tickets else 100) %}{% endfor %}
+
+                        <select id="eventFilterSelect" class="form-select form-select-sm" onchange="fetchCheckinData()">
+                            <option value="ALL" data-tickets="{{ grand_total_tickets.count }}">Alla Evenemang (Totalt)</option>
+                            {% for e in events %}
+                                <option value="{{ e.title }}" data-tickets="{{ e.total_tickets if e.total_tickets else 100 }}">
+                                    {{ e.title }} ({{ e.date }}) - {{ e.total_tickets if e.total_tickets else 100 }} platser
+                                </option>
+                            {% endfor %}
+                        </select>
+                    </div>
+
+                    <div class="badge bg-white border text-dark fs-6 px-3 py-2 mt-3 shadow-sm">
+                        Insläppta: <strong id="checkedInDisplay" class="text-success fs-5">0</strong> / <span id="totalTicketsDisplay" class="fs-5">{{ grand_total_tickets.count }}</span> biljetter (<span id="percentDisplay" class="text-primary fw-bold">0.0%</span>)
+                    </div>
+                </div>
+            </div>
+
+            <div class="mb-4">
+                <div class="progress" style="height: 16px;">
+                    <div id="checkinProgressBar" class="progress-bar bg-success progress-bar-striped progress-bar-animated" style="width: 0%;"></div>
+                </div>
+            </div>
+
+            <div class="row">
+                <div class="col-md-7 mb-3">
+                    <div class="card p-3 bg-light border">
+                        <h5 class="fs-6 fw-bold mb-3">📈 Antal insläpp per timme (15:00 - 07:00)</h5>
+                        <canvas id="checkinChart" height="180"></canvas>
+                    </div>
+                </div>
+
+                <div class="col-md-5 mb-3">
+                    <div class="card p-3 bg-light border" style="max-height: 280px; overflow-y: auto;">
+                        <h5 class="fs-6 fw-bold mb-3">⏱️ Historik över senaste skanningar</h5>
+                        <ul id="scanHistoryList" class="list-group list-group-flush small">
+                            <li class="list-group-item bg-transparent text-center text-muted py-4">Inga insläpp registrerade ännu.</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- SECTION 13: AKTIONSLOGG -->
+        <section id="logs" class="admin-section mb-5">
             <h3 class="mb-3">Aktionslogg</h3>
             <div class="card p-3 shadow-sm bg-white">
                 <div class="table-scroll-container">
@@ -2303,8 +3903,10 @@ ADMIN_DASHBOARD_TEMPLATE = """
                 </div>
             </div>
         </section>
+
     </div>
 
+    <!-- MODAL STATS -->
     <div class="modal fade" id="editStatsModal" tabindex="-1">
       <div class="modal-dialog"><div class="modal-content">
         <form action="/admin/update_stats" method="POST">
@@ -2322,7 +3924,57 @@ ADMIN_DASHBOARD_TEMPLATE = """
       </div></div>
     </div>
 
+    <script src="https://unpkg.com/@zxing/library@latest"></script>
     <script>
+        function openNav() {
+            document.getElementById("adminSidebar").style.width = "280px";
+            document.getElementById("sidebarOverlay").classList.add("active");
+        }
+    
+        function closeNav() {
+            document.getElementById("adminSidebar").style.width = "0";
+            document.getElementById("sidebarOverlay").classList.remove("active");
+        }
+    
+        function showSection(sectionId) {
+            const sections = document.querySelectorAll('.admin-section');
+            sections.forEach(sec => sec.classList.remove('active-section'));
+    
+            const target = document.getElementById(sectionId);
+            if (target) {
+                target.classList.add('active-section');
+            }
+    
+            const links = document.querySelectorAll('.admin-sidebar a');
+            links.forEach(l => l.classList.remove('active'));
+            if (event && event.currentTarget) {
+                event.currentTarget.classList.add('active');
+            }
+    
+            closeNav();
+        }
+    
+        function updateAdminClock() {
+            const now = new Date();
+            const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+            const options = { 
+                weekday: 'long', 
+                year: 'numeric', 
+                month: 'long', 
+                day: 'numeric', 
+                hour: '2-digit', 
+                minute: '2-digit', 
+                second: '2-digit' 
+            };
+            const formattedDate = now.toLocaleDateString('sv-SE', options);
+            const clockElem = document.getElementById('adminLocalTime');
+            if (clockElem) {
+                clockElem.innerHTML = `🕒 <strong>Lokal Tid (${timeZone}):</strong> ${formattedDate}`;
+            }
+        }
+        setInterval(updateAdminClock, 1000);
+        updateAdminClock();
+    
         const ctxBar = document.getElementById('barChart').getContext('2d');
         new Chart(ctxBar, {
             type: 'bar',
@@ -2335,7 +3987,7 @@ ADMIN_DASHBOARD_TEMPLATE = """
             },
             options: { responsive: true, scales: { y: { beginAtZero: true } } }
         });
-
+    
         const ctxPie = document.getElementById('pieChart').getContext('2d');
         new Chart(ctxPie, {
             type: 'pie',
@@ -2348,6 +4000,196 @@ ADMIN_DASHBOARD_TEMPLATE = """
             },
             options: { responsive: true }
         });
+    
+        const ctxLogin = document.getElementById('loginProvidersChart').getContext('2d');
+        new Chart(ctxLogin, {
+            type: 'doughnut',
+            data: {
+                labels: ['Google', 'Apple', 'Facebook', 'Instagram', 'TikTok', 'E-post'],
+                datasets: [{
+                    data: [{{ ns.google }}, {{ ns.apple }}, {{ ns.facebook }}, {{ ns.instagram }}, {{ ns.tiktok }}, {{ ns.email }}],
+                    backgroundColor: ['#dc3545', '#000000', '#0d6efd', '#6c757d', '#111111', '#adb5bd']
+                }]
+            },
+            options: {
+                responsive: true,
+                plugins: {
+                    legend: { position: 'bottom' }
+                }
+            }
+        });
+    
+        const checkinHours = ['15:00', '16:00', '17:00', '18:00', '19:00', '20:00', '21:00', '22:00', '23:00', '00:00', '01:00', '02:00', '03:00', '04:00', '05:00', '06:00', '07:00'];
+        const ctxCheckin = document.getElementById('checkinChart').getContext('2d');
+    
+        let checkinChartInstance = new Chart(ctxCheckin, {
+            type: 'bar',
+            data: {
+                labels: checkinHours,
+                datasets: [{
+                    label: 'Insläppta besökare',
+                    data: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    backgroundColor: '#198754',
+                    borderRadius: 4
+                }]
+            },
+            options: {
+                responsive: true,
+                plugins: { legend: { display: false } },
+                scales: { y: { beginAtZero: true, ticks: { precision: 0 } } }
+            }
+        });
+    
+        function fetchCheckinData() {
+            const selectElem = document.getElementById('eventFilterSelect');
+            if (!selectElem) return;
+            const selectedEvent = selectElem.value;
+            const selectedOption = selectElem.options[selectElem.selectedIndex];
+            const eventTicketsQuota = parseInt(selectedOption.getAttribute('data-tickets')) || 100;
+    
+            fetch(`/api/get_checkin_stats?event=${encodeURIComponent(selectedEvent)}`)
+                .then(res => {
+                    if (!res.ok) throw new Error("Erreur serveur " + res.status);
+                    return res.json();
+                })
+                .then(data => {
+                    const checkedIn = data.checked_in;
+                    const percent = eventTicketsQuota > 0 ? ((checkedIn / eventTicketsQuota) * 100).toFixed(1) : 0;
+    
+                    document.getElementById('checkedInDisplay').innerText = checkedIn;
+                    document.getElementById('totalTicketsDisplay').innerText = eventTicketsQuota;
+                    document.getElementById('percentDisplay').innerText = percent + '%';
+                    document.getElementById('checkinProgressBar').style.width = percent + '%';
+    
+                    checkinChartInstance.data.datasets[0].data = data.hourly_counts;
+                    checkinChartInstance.update();
+    
+                    const historyList = document.getElementById('scanHistoryList');
+                    if (data.history.length === 0) {
+                        historyList.innerHTML = '<li class="list-group-item bg-transparent text-center text-muted py-4">Inga insläpp registrerade ännu.</li>';
+                    } else {
+                        historyList.innerHTML = data.history.map(item => `
+                            <li class="list-group-item bg-transparent d-flex justify-content-between align-items-center py-2">
+                                <div>
+                                    <span class="fw-bold">🎫 ${item.category}</span>
+                                    <small class="text-muted d-block">${item.timestamp}</small>
+                                </div>
+                                <span class="badge bg-success">Insläppt</span>
+                            </li>
+                        `).join('');
+                    }
+                })
+                .catch(err => console.error("Erreur lors de l'actualisation du check-in :", err));
+        }
+    
+        fetchCheckinData();
+        // Rafraîchissement automatique toutes les 10 secondes au lieu de 3s (évite l'erreur 429)
+        setInterval(fetchCheckinData, 10000);
+    
+        function exportFilteredCSV() {
+            const yearSelect = document.querySelector('select[name="year"]');
+            const monthSelect = document.querySelector('select[name="month"]');
+            const year = yearSelect ? yearSelect.value : '';
+            const month = monthSelect ? monthSelect.value : '';
+            window.location.href = `/admin/export_sales_csv?year=${year}&month=${month}`;
+        }
+    
+        let codeReader = null;
+        let isCameraActive = true;
+        let flashOn = false;
+    
+        window.addEventListener('load', function () {
+            startScanner();
+        });
+    
+        function startScanner() {
+            codeReader = new ZXing.BrowserQRCodeReader();
+            codeReader.decodeFromInputVideoDevice(undefined, 'preview').then((result) => {
+                fetch('/api/scan_ticket', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ ticket_code: result.text })
+                })
+                .then(res => res.json())
+                .then(data => {
+                    const resDiv = document.getElementById('scan-result');
+                    resDiv.classList.remove('d-none', 'alert-success', 'alert-danger', 'alert-warning');
+    
+                    if (data.status === 'VALID') {
+                        resDiv.classList.add('alert-success');
+                        resDiv.innerHTML = `
+                            <h5 class="fw-bold mb-1">✅ GILTIG BILJETT</h5>
+                            <p class="mb-1"><strong>Kategori:</strong> ${data.category}</p>
+                            <p class="mb-1"><strong>Gäst:</strong> ${data.guest_name}</p>
+                            <p class="mb-0"><strong>Minimiålder:</strong> ${data.min_age} år (Kontrollera ID-kort!)</p>
+                        `;
+                        fetchCheckinData();
+                    } else if (data.status === 'ALREADY_USED') {
+                        resDiv.classList.add('alert-warning');
+                        resDiv.innerHTML = `
+                            <h5 class="fw-bold mb-1">⚠️ REDAN ANVÄND BILJETT</h5>
+                            <p class="mb-0">${data.message}</p>
+                        `;
+                    } else {
+                        resDiv.classList.add('alert-danger');
+                        resDiv.innerHTML = `
+                            <h5 class="fw-bold mb-1">❌ OGILTIG BILJETT</h5>
+                            <p class="mb-0">${data.message}</p>
+                        `;
+                    }
+                }).catch(err => console.error(err));
+            }).catch(err => console.error("Kunde inte starta kameran: ", err));
+        }
+    
+        function toggleCamera() {
+            const videoElement = document.getElementById('preview');
+            const btn = document.getElementById('toggleCameraBtn');
+            const flashBtn = document.getElementById('toggleFlashBtn');
+    
+            if (isCameraActive) {
+                const stream = videoElement.srcObject;
+                if (stream) {
+                    stream.getTracks().forEach(track => track.stop());
+                }
+                videoElement.srcObject = null;
+                if (codeReader) codeReader.reset();
+    
+                btn.innerText = "📷 Sätt på kamera";
+                btn.classList.replace('btn-dark', 'btn-outline-dark');
+                flashBtn.disabled = true;
+                isCameraActive = false;
+            } else {
+                startScanner();
+                btn.innerText = "📷 Stäng av kamera";
+                btn.classList.replace('btn-outline-dark', 'btn-dark');
+                flashBtn.disabled = false;
+                isCameraActive = true;
+            }
+        }
+    
+        async function toggleFlash() {
+            const videoElement = document.getElementById('preview');
+            const stream = videoElement.srcObject;
+            if (stream) {
+                const track = stream.getVideoTracks()[0];
+                try {
+                    flashOn = !flashOn;
+                    await track.applyConstraints({
+                        advanced: [{ torch: flashOn }]
+                    });
+                    const flashBtn = document.getElementById('toggleFlashBtn');
+                    if (flashOn) {
+                        flashBtn.classList.replace('btn-outline-dark', 'btn-warning');
+                        flashBtn.innerText = "⚡ Stäng av Flash";
+                    } else {
+                        flashBtn.classList.replace('btn-warning', 'btn-outline-dark');
+                        flashBtn.innerText = "⚡ Flash (Ficklampa)";
+                    }
+                } catch (err) {
+                    alert("Flash stöds inte av denna enhet eller webbläsare.");
+                }
+            }
+        }
     </script>
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 </body>
@@ -2537,6 +4379,267 @@ SUCCESS_TEMPLATE = """
             </div>
         </div>
     </div>
+</body>
+</html>
+"""
+
+SCANNER_LOGIN_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>URBAN NATION - Entré Skanner</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body class="bg-dark text-white d-flex align-items-center justify-content-center min-vh-100">
+    <div class="card p-4 bg-black text-white border-secondary shadow-lg text-center" style="max-width: 400px; width: 100%;">
+        <h3 class="fw-bold mb-1">📱 URBAN NATION</h3>
+        <p class="text-muted small mb-3">Entré & Biljettskanner för Ordningsvakter</p>
+        <div class="alert alert-info py-1 px-2 small mb-3">
+            ⏰ Giltig till: <strong>{{ expires }}</strong>
+        </div>
+
+        {% with messages = get_flashed_messages(with_categories=true) %}
+          {% if messages %}{% for c, m in messages %}<div class="alert alert-{{ c }} py-2 small">{{ m }}</div>{% endfor %}{% endif %}
+        {% endwith %}
+
+        <form method="POST">
+            <div class="mb-3 text-start">
+                <label class="form-label small text-muted">Ange Engångslösenord</label>
+                <input type="text" class="form-control text-center fw-bold fs-4 bg-dark text-white border-secondary" name="password" placeholder="XXX-XXX" required autofocus autocomplete="off">
+            </div>
+            <button type="submit" class="btn btn-warning w-100 fw-bold py-2">Lås upp Skanner</button>
+        </form>
+    </div>
+</body>
+</html>
+"""
+
+
+SCANNER_AGENT_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>URBAN NATION - Scanner</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body class="bg-dark text-white">
+    <div class="container text-center my-3" style="max-width: 500px;">
+        <div class="d-flex justify-content-between align-items-center mb-3 border-bottom pb-2">
+            <h4 class="fw-bold mb-0">📱 Ticket Scanner</h4>
+            <span class="badge bg-danger">⏰ Max 6h (Till {{ expires }})</span>
+        </div>
+
+        <div class="d-flex justify-content-center gap-2 mb-3">
+            <button id="toggleCameraBtn" class="btn btn-light btn-sm fw-bold" onclick="toggleCamera()">📷 Stäng av kamera</button>
+            <button id="toggleFlashBtn" class="btn btn-outline-warning btn-sm fw-bold" onclick="toggleFlash()">⚡ Flash</button>
+        </div>
+
+        <div id="scanner-container" class="border border-secondary rounded bg-black mb-3 position-relative overflow-hidden" style="height: 320px;">
+            <video id="preview" style="width: 100%; height: 100%; object-fit: cover;"></video>
+        </div>
+
+        <div id="scan-result" class="alert d-none text-start"></div>
+    </div>
+
+    <script src="https://unpkg.com/@zxing/library@latest"></script>
+    <script>
+        let codeReader = null;
+        let isCameraActive = true;
+        let flashOn = false;
+
+        window.addEventListener('load', function () { startScanner(); });
+
+        function startScanner() {
+            codeReader = new ZXing.BrowserQRCodeReader();
+            codeReader.decodeFromInputVideoDevice(undefined, 'preview').then((result) => {
+                fetch('/api/scan_ticket', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ ticket_code: result.text })
+                })
+                .then(res => res.json())
+                .then(data => {
+                    const resDiv = document.getElementById('scan-result');
+                    resDiv.classList.remove('d-none', 'alert-success', 'alert-danger', 'alert-warning');
+                    if (data.status === 'VALID') {
+                        resDiv.classList.add('alert-success');
+                        resDiv.innerHTML = `<h5 class="fw-bold">✅ GILTIG BILJETT</h5><p class="mb-1"><strong>Kategori:</strong> ${data.category}</p><p class="mb-0"><strong>Gäst:</strong> ${data.guest_name}</p>`;
+                    } else {
+                        resDiv.classList.add('alert-danger');
+                        resDiv.innerHTML = `<h5 class="fw-bold">❌ OGILTIG / ANVÄND BILJETT</h5><p class="mb-0">${data.message}</p>`;
+                    }
+                });
+            }).catch(err => console.error(err));
+        }
+
+        function toggleCamera() {
+            const videoElement = document.getElementById('preview');
+            const btn = document.getElementById('toggleCameraBtn');
+            if (isCameraActive) {
+                const stream = videoElement.srcObject;
+                if (stream) stream.getTracks().forEach(track => track.stop());
+                videoElement.srcObject = null;
+                if (codeReader) codeReader.reset();
+                btn.innerText = "📷 Starta kamera";
+                isCameraActive = false;
+            } else {
+                startScanner();
+                btn.innerText = "📷 Stäng av kamera";
+                isCameraActive = true;
+            }
+        }
+
+        async function toggleFlash() {
+            const stream = document.getElementById('preview').srcObject;
+            if (stream) {
+                const track = stream.getVideoTracks()[0];
+                try {
+                    flashOn = !flashOn;
+                    await track.applyConstraints({ advanced: [{ torch: flashOn }] });
+                } catch (err) { alert("Flash stöds inte på denna enhet."); }
+            }
+        }
+    </script>
+</body>
+</html>
+"""
+
+SALES_REPORT_PDF_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+    <meta charset="UTF-8">
+    <title>Moms- & Försäljningsrapport - URBAN NATION</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #ffffff; color: #000; }
+        @media print {
+            .no-print { display: none !important; }
+            body { padding: 0; margin: 0; }
+        }
+    </style>
+</head>
+<body class="p-5">
+
+    <div class="d-flex justify-content-between align-items-center mb-4 no-print border-bottom pb-3">
+        <div>
+            <a href="/admin" class="btn btn-outline-dark btn-sm">← Tillbaka till Admin Dashboard</a>
+        </div>
+        <button onclick="window.print()" class="btn btn-dark btn-lg fw-bold">🖨️ Skriv ut / Spara som PDF</button>
+    </div>
+
+    <!-- EN-TÊTE DU RAPPORT COMPTABLE -->
+    <div class="row align-items-center mb-4 border-bottom pb-3">
+        <div class="col-8">
+            <h1 class="fw-bold mb-1">URBAN NATION</h1>
+            <h4 class="text-uppercase text-muted">Moms- & Försäljningsrapport (Bokföring)</h4>
+            <p class="small text-muted mb-0">Rapport genererad: <strong>{{ now_date }}</strong></p>
+        </div>
+        <div class="col-4 text-end">
+            <div class="p-3 bg-light border rounded">
+                <small class="text-muted d-block">Total Omsättning (Inkl. moms)</small>
+                <h3 class="fw-bold mb-0 text-dark">{{ total_grand_incl }} SEK</h3>
+            </div>
+        </div>
+    </div>
+
+    <!-- RÉCAPITULATIF PAR TAUX DE TVA (MOMS-SUMMERING) -->
+    <h5 class="fw-bold mb-3">📊 Momssummering per skattesats</h5>
+    <div class="row mb-4">
+        <div class="col-md-6 mb-2">
+            <div class="p-3 border rounded bg-light">
+                <div class="d-flex justify-content-between">
+                    <span><strong>Kläder & Merch (25% moms)</strong></span>
+                    <span class="badge bg-dark">25%</span>
+                </div>
+                <hr class="my-2">
+                <div class="d-flex justify-content-between small">
+                    <span>Brutto (Inkl. moms):</span>
+                    <strong>{{ total_clothing_incl }} SEK</strong>
+                </div>
+                <div class="d-flex justify-content-between small text-danger">
+                    <span>Beräknad Moms (25%):</span>
+                    <strong>{{ total_clothing_vat }} SEK</strong>
+                </div>
+                <div class="d-flex justify-content-between small text-muted">
+                    <span>Netto (Exkl. moms):</span>
+                    <span>{{ (total_clothing_incl - total_clothing_vat)|round(2) }} SEK</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="col-md-6 mb-2">
+            <div class="p-3 border rounded bg-light">
+                <div class="d-flex justify-content-between">
+                    <span><strong>Eventbiljetter (6% moms)</strong></span>
+                    <span class="badge bg-secondary">6%</span>
+                </div>
+                <hr class="my-2">
+                <div class="d-flex justify-content-between small">
+                    <span>Brutto (Inkl. moms):</span>
+                    <strong>{{ total_ticket_incl }} SEK</strong>
+                </div>
+                <div class="d-flex justify-content-between small text-danger">
+                    <span>Beräknad Moms (6%):</span>
+                    <strong>{{ total_ticket_vat }} SEK</strong>
+                </div>
+                <div class="d-flex justify-content-between small text-muted">
+                    <span>Netto (Exkl. moms):</span>
+                    <span>{{ (total_ticket_incl - total_ticket_vat)|round(2) }} SEK</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- TABLEAU DÉTAILLÉ DES TRANSACTIONS -->
+    <h5 class="fw-bold mb-3">📄 Transaktionsspecifikation</h5>
+    <table class="table table-bordered table-sm align-middle small mb-4">
+        <thead class="table-dark">
+            <tr>
+                <th>Order #</th>
+                <th>Datum</th>
+                <th>Kund</th>
+                <th>Produkt / Artikel</th>
+                <th>Typ</th>
+                <th class="text-end">Moms %</th>
+                <th class="text-end">Exkl. Moms</th>
+                <th class="text-end">Moms SEK</th>
+                <th class="text-end">Inkl. Moms</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for it in items %}
+            <tr>
+                <td>#{{ it.order_id }}</td>
+                <td>{{ it.date }}</td>
+                <td>{{ it.customer }}</td>
+                <td><strong>{{ it.item_name }}</strong></td>
+                <td>{{ it.type_label }}</td>
+                <td class="text-end">{{ it.vat_rate }}%</td>
+                <td class="text-end">{{ it.total_excl }} SEK</td>
+                <td class="text-end text-danger">{{ it.vat_amt }} SEK</td>
+                <td class="text-end fw-bold">{{ it.total_incl }} SEK</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+        <tfoot class="table-light fw-bold">
+            <tr>
+                <td colspan="6" class="text-end">Totalt:</td>
+                <td class="text-end">{{ (total_grand_incl - total_grand_vat)|round(2) }} SEK</td>
+                <td class="text-end text-danger">{{ total_grand_vat }} SEK</td>
+                <td class="text-end text-dark fs-6">{{ total_grand_incl }} SEK</td>
+            </tr>
+        </tfoot>
+    </table>
+
+    <div class="mt-5 text-center text-muted small border-top pt-3">
+        <p>© 2026 URBAN NATION AB - Officiellt bokföringsunderlag genererat automatiskt.</p>
+    </div>
+
 </body>
 </html>
 """
