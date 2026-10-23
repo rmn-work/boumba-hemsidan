@@ -50,6 +50,25 @@ limiter = Limiter(
     default_limits=["200 per day", "50 per hour"]
 )
 
+GLOBAL_LIVE = {
+    "active": False,
+    "title": "URBAN NATION Live Stream",
+    "platforms": {
+        "youtube": {"active": False, "url": ""},
+        "facebook": {"active": False, "url": ""},
+        "tiktok": {"active": False, "url": ""},
+        "instagram": {"active": False, "url": ""}
+    }
+}
+
+LIVE_ANALYTICS = {
+    "youtube": 0,
+    "facebook": 0,
+    "tiktok": 0,
+    "instagram": 0,
+    "direct": 0
+}
+
 def is_new_product(product_date_str):
     try:
         product_date = datetime.strptime(product_date_str, "%Y-%m-%d")
@@ -546,6 +565,7 @@ def agent_scanner_page(token):
 
 
 TICKET_SCANS = []
+GUESTS = []
 
 @app.route('/api/scan_ticket', methods=['POST'])
 def api_scan_ticket():
@@ -593,7 +613,7 @@ def issue_vip_ticket():
     ticket_category = request.form.get('ticket_category', 'VIP Guest')
 
     if not guest_email or not guest_name:
-        flash("E-post och namn krävs för att utfärda VIP-biljett.", "danger")
+        flash("E-post och namn krävs för att utfärda GUESTS = [VIP-biljett.", "danger")
         return redirect(url_for('admin_dashboard'))
 
     order_id = random.randint(10000, 99999)
@@ -626,6 +646,7 @@ def issue_vip_ticket():
 @app.route('/api/get_checkin_stats')
 def get_checkin_stats():
     selected_event = request.args.get('event', 'ALL')
+    show_archive = request.args.get('archive', 'false') == 'true' # Paramètre pour afficher les archives ou non
 
     if selected_event == 'ALL':
         filtered_scans = TICKET_SCANS
@@ -634,6 +655,14 @@ def get_checkin_stats():
         filtered_scans = [s for s in TICKET_SCANS if s.get('category') == selected_event]
         matching_event = next((e for e in events if e.get('title') == selected_event), None) if 'events' in globals() else None
         total_tickets = int(matching_event.get('total_tickets', 100)) if matching_event else 100
+
+    if not show_archive:
+        now = datetime.now()
+        forty_eight_hours_ago = now - timedelta(hours=48)
+        filtered_scans = [
+            s for s in filtered_scans
+            if datetime.strptime(s['timestamp'], "%Y-%m-%d %H:%M:%S") >= forty_eight_hours_ago
+        ]
 
     checked_in = len(filtered_scans)
     percent = round((checked_in / total_tickets * 100), 1) if total_tickets > 0 else 0
@@ -655,10 +684,81 @@ def get_checkin_stats():
     })
 
 
-def send_vip_invitation_email(email, name, event_name):
-    subject = f"🎉 Du har fått en VIP-inbjudan till {event_name} - URBAN NATION"
+@app.route('/admin/add_guest', methods=['POST'])
+def add_guest():
+    if not session.get('admin_logged'):
+        return redirect(url_for('admin_login'))
 
-    print(f"[EMAIL VIP] Skickat till {email}: Hej {name}, din VIP-biljett finns nu tillgänglig i ditt konto på URBAN NATION under 'Mina Biljetter'. Logga in för att hämta den och utforska vår nya kollektion!")
+    global GUESTS
+    name = request.form.get('guest_name')
+    email = request.form.get('guest_email')
+    # Récupération de la liste des événements cochés
+    selected_events = request.form.getlist('guest_events')
+
+    new_id = max([g['id'] for g in GUESTS], default=0) + 1
+
+    new_guest = {
+        "id": new_id,
+        "name": name,
+        "email": email,
+        "events_invited": selected_events,
+        "invitation_sent": False,
+        "checked_in": False,
+        "checkin_time": None,
+        "archived": False,
+        "timestamp": datetime.now().isoformat()
+    }
+
+    GUESTS.append(new_guest)
+    flash("Inbjuden gäst har lagts till!", "success")
+    return redirect(url_for('admin_dashboard') + '#guests')
+
+
+@app.route('/admin/send_invitation/<int:guest_id>', methods=['POST', 'GET'])
+def send_invitation(guest_id):
+    if not session.get('admin_logged'):
+        return redirect(url_for('admin_login'))
+
+    global GUESTS
+    for guest in GUESTS:
+        if guest['id'] == guest_id:
+            guest['invitation_sent'] = True
+            event_name = guest['events_invited'][0] if guest['events_invited'] else "URBAN NATION Event"
+            guest['invitation_sent'] = True
+            send_vip_invitation_email(guest['email'], guest['name'], event_name)
+            flash(f"Inbjudan och VIP-biljett har skickats till {guest['name']}!", "success")
+            break
+
+    return redirect(url_for('admin_dashboard') + '#guests')
+
+
+@app.route('/api/scan_guest/<int:guest_id>', methods=['POST'])
+def scan_guest(guest_id):
+    """Route appelée par le scanner pour valider la présence de l'invité"""
+    global GUESTS
+    for guest in GUESTS:
+        if guest['id'] == guest_id:
+            guest['checked_in'] = True
+            guest['checkin_time'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            return {"status": "success", "message": f"{guest['name']} är markerad som PRESENT!"}
+
+    return {"status": "error", "message": "Gäst hittades inte."}, 404
+
+
+@app.route('/admin/archive_guest/<int:guest_id>')
+def archive_guest(guest_id):
+    if not session.get('admin_logged'):
+        return redirect(url_for('admin_login'))
+
+    global GUESTS
+    for guest in GUESTS:
+        if guest['id'] == guest_id:
+            guest['archived'] = not guest.get('archived', False)  # Permet d'archiver ou de restaurer
+            status_text = "arkiverats" if guest['archived'] else "återställts"
+            flash(f"Gästen har {status_text}.", "info")
+            break
+
+    return redirect(url_for('admin_dashboard') + '#guests')
 
 
 def send_order_confirmation_email(order):
@@ -1024,7 +1124,8 @@ def index():
         current_user=current_user,
         logo_url=LOGO_URL,
         hero_bg=HERO_DJ_BG,
-        global_announcement=global_announcement
+        global_announcement=global_announcement,
+        global_live = GLOBAL_LIVE,
     )
 
 
@@ -1163,6 +1264,13 @@ def admin_dashboard():
     if not session.get('admin_logged'):
         return redirect(url_for('admin_login'))
 
+    show_all_archives = request.args.get('archive', 'false') == 'true'
+
+    if show_all_archives:
+        displayed_guests = GUESTS
+    else:
+        displayed_guests = [g for g in GUESTS if not g.get('archived', False)]
+
     total_revenue = sum(p['sold'] * (p['discount_price'] if p.get('discount_price') else p['price']) for p in PRODUCTS)
     total_items_sold = sum(p['sold'] for p in PRODUCTS)
     total_tickets_sold = sum(p['sold'] for p in PRODUCTS if p['type'] == 'ticket')
@@ -1172,14 +1280,24 @@ def admin_dashboard():
     pending_transfers = getattr(app, 'PENDING_TRANSFERS', [])
 
     return render_template_string(ADMIN_DASHBOARD_TEMPLATE,
-                                  products=PRODUCTS, events=EVENTS, product_types=PRODUCT_TYPES,
-                                  customers=CUSTOMERS, logs=ADMIN_LOGS, orders=ORDERS, returns=RETURNS,
+                                  products=PRODUCTS,
+                                  events=EVENTS,
+                                  product_types=PRODUCT_TYPES,
+                                  customers=CUSTOMERS,
+                                  logs=ADMIN_LOGS,
+                                  orders=ORDERS,
+                                  returns=RETURNS,
                                   promo_codes=PROMO_CODES,
                                   scanner_tokens=SCANNER_TOKENS,
                                   ticket_scans=TICKET_SCANS,
-                                  pending_transfers=pending_transfers,  # 👈 AJOUTÉ ICI
-                                  total_revenue=total_revenue, total_items_sold=total_items_sold,
-                                  total_tickets_sold=total_tickets_sold, ticket_revenue=ticket_revenue,
+                                  guests=displayed_guests,
+                                  global_announcement=global_announcement,
+                                  global_live=GLOBAL_LIVE,
+                                  pending_transfers=pending_transfers,
+                                  total_revenue=total_revenue,
+                                  total_items_sold=total_items_sold,
+                                  total_tickets_sold=total_tickets_sold,
+                                  ticket_revenue=ticket_revenue,
                                   logo_url=LOGO_URL)
 
 
@@ -1728,6 +1846,47 @@ def process_transfer(transfer_id, action):
 def send_ticket_transfer_email(recipient_email, sender_name, event_name):
     print(f"[EMAIL TRANSFERT] Skickat till {recipient_email}: Hej! {sender_name} har överfört sin biljett för '{event_name}' till dig på URBAN NATION. Logga in eller skapa ett konto med denna e-post för att hämta din nya QR-kod!")
 
+@app.context_processor
+def inject_global_vars():
+    return dict(
+        global_live=GLOBAL_LIVE,
+        live_analytics=LIVE_ANALYTICS
+    )
+
+@app.route('/admin/update_live', methods=['POST'])
+def update_live():
+    if not session.get('admin_logged'):
+        return redirect(url_for('admin_login'))
+
+    GLOBAL_LIVE['active'] = 'live_active' in request.form
+    GLOBAL_LIVE['title'] = request.form.get('live_title', 'URBAN NATION Live Stream')
+
+    # Mise à jour de l'état d'activation et des URLs de chaque plateforme
+    for p in ['youtube', 'facebook', 'tiktok', 'instagram']:
+        GLOBAL_LIVE['platforms'][p]['active'] = f'active_{p}' in request.form
+        GLOBAL_LIVE['platforms'][p]['url'] = request.form.get(f'url_{p}', '').strip()
+
+    return redirect('/admin#live-section')
+
+
+@app.route('/api/get_live_analytics')
+def get_live_analytics():
+    """Renvoie les statistiques actuelles de visionnage pour le Dashboard Admin."""
+    return jsonify(LIVE_ANALYTICS)
+
+
+@app.route('/api/track_live_view', methods=['POST'])
+def track_live_view():
+    """Incrémente le compteur de vues lorsqu'un internaute clique sur un onglet de plateforme."""
+    data = request.get_json() or {}
+    platform = data.get('platform', '').lower()
+
+    if platform in LIVE_ANALYTICS:
+        LIVE_ANALYTICS[platform] += 1
+        return jsonify({"status": "success", "analytics": LIVE_ANALYTICS})
+
+    return jsonify({"status": "error", "message": "Plattform hittades inte"}), 400
+
 
 # --- STYLES HARMONISÉS NOIR & BLANC (SANS JAUNE, TEXTES LISIBLES) ---
 
@@ -1925,122 +2084,196 @@ HOME_TEMPLATE = """
         </div>
     </nav>
 
-    <div class="container my-5">
-        {% with messages = get_flashed_messages(with_categories=true) %}
-          {% if messages %}
-            {% for category, message in messages %}
-              <div class="alert alert-{{ category }} rounded-3 shadow-sm">{{ message }}</div>
-            {% endfor %}
-          {% endif %}
-        {% endwith %}
-    
-        <!-- Hero Banner avec filigrane Urban Nation en arrière-plan -->
-        <div class="p-5 mb-5 text-white rounded-4 shadow-lg text-center position-relative overflow-hidden bg-urban-watermark" 
-             style="background: linear-gradient(rgba(0,0,0,0.75), rgba(0,0,0,0.88)), url('{{ hero_bg }}') center/cover no-repeat;">
-            <div class="mb-3 position-relative" style="z-index: 1;">
-                <img src="{{ logo_url }}" alt="Urban Nation Banner Logo" style="height: 110px; width: 110px; border-radius: 50%; object-fit: cover; border: 3px solid #ffffff;" class="shadow" onerror="this.style.display='none'">
-            </div>
-            <h1 class="fw-bold display-4 text-uppercase tracking-wide text-white position-relative" style="z-index: 1;">URBAN <span style="color: #ffffff;">NATION</span></h1>
-            <p class="lead text-light max-w-700 mx-auto opacity-90 position-relative" style="z-index: 1;">xxx</p>
-            <div class="d-flex justify-content-center gap-3 mt-4 position-relative" style="z-index: 1;">
-                <a href="#catalog-section" class="btn btn-warning btn-lg px-4 fw-bold">Utforska Shoppen</a>
-                <a href="#events-section" class="btn btn-outline-light btn-lg px-4">Boka Eventbiljetter</a>
-            </div>
+   <div class="container my-5">
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        {% for category, message in messages %}
+          <div class="alert alert-{{ category }} rounded-3 shadow-sm">{{ message }}</div>
+        {% endfor %}
+      {% endif %}
+    {% endwith %}
+
+    <!-- Hero Banner avec filigrane Urban Nation en arrière-plan -->
+    <div class="p-5 mb-5 text-white rounded-4 shadow-lg text-center position-relative overflow-hidden bg-urban-watermark" 
+         style="background: linear-gradient(rgba(0,0,0,0.75), rgba(0,0,0,0.88)), url('{{ hero_bg }}') center/cover no-repeat;">
+        <div class="mb-3 position-relative" style="z-index: 1;">
+            <img src="{{ logo_url }}" alt="Urban Nation Banner Logo" style="height: 110px; width: 110px; border-radius: 50%; object-fit: cover; border: 3px solid #ffffff;" class="shadow" onerror="this.style.display='none'">
         </div>
-        
-        <hr class="my-4">
+        <h1 class="fw-bold display-4 text-uppercase tracking-wide text-white position-relative" style="z-index: 1;">URBAN <span style="color: #ffffff;">NATION</span></h1>
+        <p class="lead text-light max-w-700 mx-auto opacity-90 position-relative" style="z-index: 1;">xxx</p>
+        <div class="d-flex justify-content-center gap-3 mt-4 position-relative" style="z-index: 1;">
+            <a href="#catalog-section" class="btn btn-warning btn-lg px-4 fw-bold">Utforska Shoppen</a>
+            <a href="#events-section" class="btn btn-outline-light btn-lg px-4">Boka Eventbiljetter</a>
+        </div>
+    </div>
     
-        <!-- 🚀 AFFICHAGE DE L'ANNONCE GLOBALE "UNDER FÖRBEREDELSE" SI ACTIVÉE -->
-        {% if global_announcement and global_announcement.active %}
-            <div class="alert alert-warning border border-warning shadow-sm rounded-4 p-4 mb-4 position-relative" role="alert">
-                <div class="d-flex align-items-start gap-3">
-                    <div class="fs-2">🚧</div>
-                    <div class="flex-grow-1">
-                        <h4 class="alert-heading fw-bold text-dark mb-1">Under förberedelse</h4>
-                        <p class="mb-2 text-dark fs-6">{{ global_announcement.text }}</p>
-                        {% if global_announcement.image %}
-                            <div class="mt-2">
-                                <img src="{{ global_announcement.image }}" alt="Annonce" style="max-height: 180px; border-radius: 8px; object-fit: cover;" class="shadow-sm">
-                            </div>
-                        {% endif %}
-                    </div>
+    <hr class="my-4">
+
+    <!-- 🚀 AFFICHAGE DE L'ANNONCE GLOBALE "UNDER FÖRBEREDELSE" SI ACTIVÉE -->
+    {% if global_announcement and global_announcement.active %}
+        <div class="alert alert-warning border border-warning shadow-sm rounded-4 p-4 mb-4 position-relative" role="alert">
+            <div class="d-flex align-items-start gap-3">
+                <div class="fs-2">🚧</div>
+                <div class="flex-grow-1">
+                    <h4 class="alert-heading fw-bold text-dark mb-1">Under förberedelse</h4>
+                    <p class="mb-2 text-dark fs-6">{{ global_announcement.text }}</p>
+                    {% if global_announcement.image %}
+                        <div class="mt-2">
+                            <img src="{{ global_announcement.image }}" alt="Annonce" style="max-height: 180px; border-radius: 8px; object-fit: cover;" class="shadow-sm">
+                        </div>
+                    {% endif %}
                 </div>
             </div>
-        {% endif %}
-        
-        <div id="events-section" class="pt-3">
-            <div class="d-flex justify-content-between align-items-center mb-4">
-                <h2>Kommande Evenemang & Fester</h2>
-                <span class="badge bg-dark fs-6 px-3 py-2 rounded-pill text-white border border-light">Exklusiva Event</span>
+        </div>
+    {% endif %}
+    
+    <!-- 🔴 WIDGET FLOTTANT DE LIVE STREAMING MULTI-PLATEFORME -->
+    {% if global_live.active and (global_live.platforms.youtube.active or global_live.platforms.facebook.active or global_live.platforms.tiktok.active or global_live.platforms.instagram.active) %}
+    <div id="live-floating-widget" class="position-fixed bottom-0 end-0 m-3 shadow-lg rounded-4 overflow-hidden bg-dark border border-warning" style="width: 340px; z-index: 2000;">
+        <div class="d-flex justify-content-between align-items-center bg-black px-3 py-2 text-white">
+            <span class="small fw-bold text-danger">🔴 LIVE MULTI-STREAM</span>
+            <button type="button" class="btn-close btn-close-white btn-sm" onclick="document.getElementById('live-floating-widget').style.display='none'"></button>
+        </div>
+    
+        <!-- ONGLETS DE SÉLECTION DE LA PLATEFORME PAR L'UTILISATEUR -->
+        <ul class="nav nav-tabs nav-justified bg-secondary bg-opacity-25 border-bottom border-secondary" style="font-size: 0.75rem;">
+            {% if global_live.platforms.youtube.active %}
+            <li class="nav-item">
+                <button class="nav-link active text-white fw-bold py-1" data-bs-toggle="tab" data-bs-target="#tab-yt">YouTube</button>
+            </li>
+            {% endif %}
+            {% if global_live.platforms.facebook.active %}
+            <li class="nav-item">
+                <button class="nav-link text-white fw-bold py-1" data-bs-toggle="tab" data-bs-target="#tab-fb">Facebook</button>
+            </li>
+            {% endif %}
+            {% if global_live.platforms.tiktok.active %}
+            <li class="nav-item">
+                <button class="nav-link text-white fw-bold py-1" data-bs-toggle="tab" data-bs-target="#tab-tt">TikTok</button>
+            </li>
+            {% endif %}
+            {% if global_live.platforms.instagram.active %}
+            <li class="nav-item">
+                <button class="nav-link text-white fw-bold py-1" data-bs-toggle="tab" data-bs-target="#tab-ig">Instagram</button>
+            </li>
+            {% endif %}
+        </ul>
+    
+        <!-- FLUX VIDÉO -->
+        <div class="tab-content bg-black">
+            {% if global_live.platforms.youtube.active %}
+            <div class="tab-pane fade show active" id="tab-yt">
+                <div class="ratio ratio-169">
+                    <iframe src="{{ global_live.platforms.youtube.url }}" allowfullscreen></iframe>
+                </div>
             </div>
-            <div class="row mb-5">
-                {% for event in events %}
-                <div class="col-md-6 mb-4">
-                    <div class="card h-100 shadow-sm border-0 overflow-hidden">
-                        <div class="row g-0 h-100">
-                            <div class="col-md-5">
-                                <img src="{{ event.image }}" class="img-fluid rounded-start h-100" style="object-fit: cover;" alt="{{ event.title }}">
-                            </div>
-                            <div class="col-md-7">
-                                <div class="card-body d-flex flex-column h-100">
-                                    <div class="mb-2 d-flex justify-content-between align-items-center flex-wrap gap-1">
-                                        <span class="badge bg-dark text-white border border-secondary px-2 py-1" style="background-color: #0d0d0d !important; color: #ffffff !important;">
-                                            ⏳ <span class="countdown-timer" data-date="{{ event.date }}" style="color: #ffffff !important;">Räknar ner...</span>
-                                        </span>
-                                        {% if event.min_age %}
-                                        <span class="badge bg-secondary">🔞 Åldersgräns: {{ event.min_age }} år</span>
-                                        {% endif %}
-                                    </div>
-                                    <h4 class="card-title h5">{{ event.title }}</h4>
-                                    <p class="text-muted small mb-2">📍 {{ event.location }} (⏰ {{ event.time }})</p>
-                                    <p class="card-text text-muted small flex-grow-1">{{ event.desc }}</p>
-        
-                                    <!-- Jauges visuelles par zone / catégorie définie par l'admin -->
-                                    <div class="mt-2">
-                                        <h6 class="fw-bold mb-2 small text-uppercase">Välj biljettyp & tillgängliga zoner:</h6>
-                                    
-                                        {% set categories = event.categories if event.categories else [
-                                            {"name": "Standard", "price": event.price, "total_stock": 100, "sold": 0}
-                                        ] %}
-                                    
-                                        {% for cat in categories %}
-                                        <div class="mb-2 p-2 border rounded bg-light">
-                                            <div class="d-flex justify-content-between mb-1" style="font-size: 0.85rem;">
-                                                <strong>{{ cat.name }}</strong>
-                                                <span class="fw-bold">{{ cat.price }} SEK</span>
-                                            </div>
-                                            {% set stock_total = cat.total_stock if cat.total_stock > 0 else 100 %}
-                                            {% set sold_count = cat.sold if cat.sold else 0 %}
-                                            {% set percent = ((sold_count / stock_total) * 100)|round %}
-                                            
-                                            <div class="progress mb-1" style="height: 6px;">
-                                                <div class="progress-bar {% if percent > 85 %}bg-danger{% else %}bg-dark{% endif %}" style="width: {{ percent }}%;"></div>
-                                            </div>
-                                            <div class="d-flex justify-content-between text-muted" style="font-size: 0.7rem;">
-                                                <span>{{ stock_total - sold_count }} platser kvar</span>
-                                                <span>{{ percent }}% Sålt</span>
-                                            </div>
-                                    
-                                            {% set match_id = 3 %}
-                                            {% for p in products %}
-                                                {% if event.title in p.name %}{% set match_id = p.id %}{% endif %}
-                                            {% endfor %}
-                                    
-                                            <form action="/add/{{ match_id }}" method="POST" class="mt-1">
-                                                <input type="hidden" name="ticket_category" value="{{ cat.name|lower }}">
-                                                <button type="submit" class="btn btn-dark btn-sm w-100" style="font-size: 0.75rem; padding: 2px;">Boka {{ cat.name }}</button>
-                                            </form>
+            {% endif %}
+    
+            {% if global_live.platforms.facebook.active %}
+            <div class="tab-pane fade {% if not global_live.platforms.youtube.active %}show active{% endif %}" id="tab-fb">
+                <div class="ratio ratio-169">
+                    <iframe src="{{ global_live.platforms.facebook.url }}" allowfullscreen></iframe>
+                </div>
+            </div>
+            {% endif %}
+    
+            {% if global_live.platforms.tiktok.active %}
+            <div class="tab-pane fade {% if not global_live.platforms.youtube.active and not global_live.platforms.facebook.active %}show active{% endif %}" id="tab-tt">
+                <div class="ratio ratio-169">
+                    <iframe src="{{ global_live.platforms.tiktok.url }}" allowfullscreen></iframe>
+                </div>
+            </div>
+            {% endif %}
+    
+            {% if global_live.platforms.instagram.active %}
+            <div class="tab-pane fade {% if not global_live.platforms.youtube.active and not global_live.platforms.facebook.active and not global_live.platforms.tiktok.active %}show active{% endif %}" id="tab-ig">
+                <div class="ratio ratio-169">
+                    <iframe src="{{ global_live.platforms.instagram.url }}" allowfullscreen></iframe>
+                </div>
+            </div>
+            {% endif %}
+        </div>
+    
+        <div class="p-2 bg-dark text-white text-center small fw-bold">
+            {{ global_live.title }}
+        </div>
+    </div>
+    {% endif %}
+    
+    <div id="events-section" class="pt-3">
+        <div class="d-flex justify-content-between align-items-center mb-4">
+            <h2>Kommande Evenemang & Fester</h2>
+            <span class="badge bg-dark fs-6 px-3 py-2 rounded-pill text-white border border-light">Exklusiva Event</span>
+        </div>
+        <div class="row mb-5">
+            {% for event in events %}
+            <div class="col-md-6 mb-4">
+                <div class="card h-100 shadow-sm border-0 overflow-hidden">
+                    <div class="row g-0 h-100">
+                        <div class="col-md-5">
+                            <img src="{{ event.image }}" class="img-fluid rounded-start h-100" style="object-fit: cover;" alt="{{ event.title }}">
+                        </div>
+                        <div class="col-md-7">
+                            <div class="card-body d-flex flex-column h-100">
+                                <div class="mb-2 d-flex justify-content-between align-items-center flex-wrap gap-1">
+                                    <span class="badge bg-dark text-white border border-secondary px-2 py-1" style="background-color: #0d0d0d !important; color: #ffffff !important;">
+                                        ⏳ <span class="countdown-timer" data-date="{{ event.date }}" style="color: #ffffff !important;">Räknar ner...</span>
+                                    </span>
+                                    {% if event.min_age %}
+                                    <span class="badge bg-secondary">🔞 Åldersgräns: {{ event.min_age }} år</span>
+                                    {% endif %}
+                                </div>
+                                <h4 class="card-title h5">{{ event.title }}</h4>
+                                <p class="text-muted small mb-2">📍 {{ event.location }} (⏰ {{ event.time }})</p>
+                                <p class="card-text text-muted small flex-grow-1">{{ event.desc }}</p>
+    
+                                <!-- Jauges visuelles par zone / catégorie définie par l'admin -->
+                                <div class="mt-2">
+                                    <h6 class="fw-bold mb-2 small text-uppercase">Välj biljettyp & tillgängliga zoner:</h6>
+                                
+                                    {% set categories = event.categories if event.categories else [
+                                        {"name": "Standard", "price": event.price, "total_stock": 100, "sold": 0}
+                                    ] %}
+                                
+                                    {% for cat in categories %}
+                                    <div class="mb-2 p-2 border rounded bg-light">
+                                        <div class="d-flex justify-content-between mb-1" style="font-size: 0.85rem;">
+                                            <strong>{{ cat.name }}</strong>
+                                            <span class="fw-bold">{{ cat.price }} SEK</span>
                                         </div>
+                                        {% set stock_total = cat.total_stock if cat.total_stock > 0 else 100 %}
+                                        {% set sold_count = cat.sold if cat.sold else 0 %}
+                                        {% set percent = ((sold_count / stock_total) * 100)|round %}
+                                        
+                                        <div class="progress mb-1" style="height: 6px;">
+                                            <div class="progress-bar {% if percent > 85 %}bg-danger{% else %}bg-dark{% endif %}" style="width: {{ percent }}%;"></div>
+                                        </div>
+                                        <div class="d-flex justify-content-between text-muted" style="font-size: 0.7rem;">
+                                            <span>{{ stock_total - sold_count }} platser kvar</span>
+                                            <span>{{ percent }}% Sålt</span>
+                                        </div>
+                                
+                                        {% set match_id = 3 %}
+                                        {% for p in products %}
+                                            {% if event.title in p.name %}{% set match_id = p.id %}{% endif %}
                                         {% endfor %}
+                                
+                                        <form action="/add/{{ match_id }}" method="POST" class="mt-1">
+                                            <input type="hidden" name="ticket_category" value="{{ cat.name|lower }}">
+                                            <button type="submit" class="btn btn-dark btn-sm w-100" style="font-size: 0.75rem; padding: 2px;">Boka {{ cat.name }}</button>
+                                        </form>
                                     </div>
+                                    {% endfor %}
                                 </div>
                             </div>
                         </div>
                     </div>
                 </div>
-                {% endfor %}
             </div>
+            {% endfor %}
         </div>
+    </div>
+
 
         <hr class="my-4">
 
@@ -2254,9 +2487,9 @@ HOME_TEMPLATE = """
                 const eventDate = new Date(eventDateStr + "T23:59:59").getTime();
                 const now = new Date().getTime();
                 const distance = eventDate - now;
-
+    
                 timer.style.setProperty('color', '#ffffff', 'important');
-
+    
                 if (distance < 0) {
                     timer.innerText = "🎉 Eventet har börjat!";
                 } else {
@@ -2269,7 +2502,7 @@ HOME_TEMPLATE = """
         }
         setInterval(updateCountdowns, 1000);
         updateCountdowns();
-
+    
         function filterCategory(catId, btn) {
             document.querySelectorAll('.filter-btn').forEach(b => {
                 b.classList.remove('btn-dark', 'active');
@@ -2285,9 +2518,9 @@ HOME_TEMPLATE = """
                 if ((catId === 'all' || cat === catId) && name.includes(searchInput)) { item.style.display = ""; } else { item.style.display = "none"; }
             }
         }
-
+    
         function changeProductImage(prodId, newSrc) { document.getElementById('main-img-' + prodId).src = newSrc; }
-
+    
         function filterAllProducts() {
             let input = document.getElementById('searchAllProducts').value.toLowerCase();
             let items = document.getElementsByClassName('product-item');
@@ -2295,7 +2528,7 @@ HOME_TEMPLATE = """
                 if (item.getAttribute('data-name').includes(input)) { item.style.display = ""; } else { item.style.display = "none"; }
             }
         }
-
+    
         function sortAllProducts() {
             let sortVal = document.getElementById('sortAllProducts').value;
             let container = document.getElementById('allProductsContainer');
@@ -2310,6 +2543,25 @@ HOME_TEMPLATE = """
             });
             itemsArray.forEach(item => container.appendChild(item));
         }
+    
+        // --- TRACKING DES CLICS SUR LES ONGLETS DU LIVE STREAM ---
+        function trackPlatformClick(platform) {
+            fetch('/api/track_live_view', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ platform: platform })
+            }).catch(err => console.error("Erreur de tracking live :", err));
+        }
+    
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('#live-floating-widget .nav-link').forEach(btn => {
+                btn.addEventListener('click', function() {
+                    const platform = this.innerText.trim().toLowerCase();
+                    trackPlatformClick(platform);
+                });
+            });
+        });
+        // --------------------------------------------------------
     </script>
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 </body>
@@ -2949,6 +3201,7 @@ ADMIN_DASHBOARD_TEMPLATE = """
 
         <div class="admin-sidebar-content">
             <a href="#" onclick="showSection('stats'); return false;" class="menu-link active text-end">📊 Statistik</a>
+            <a href="#" onclick="showSection('live-section'); return false;" class="menu-link text-end">📡 Styrning av Live Streaming</a>
             <a href="#" onclick="showSection('categories'); return false;" class="menu-link text-end">🏷️ Kategorier</a>
             <a href="#" onclick="showSection('orders'); return false;" class="menu-link text-end">🚚 Beställningar</a>
             <a href="#" onclick="showSection('returns'); return false;" class="menu-link text-end">🔄 Returer</a>
@@ -2956,7 +3209,7 @@ ADMIN_DASHBOARD_TEMPLATE = """
             <a href="#" onclick="showSection('events'); return false;" class="menu-link text-end">🎉 Event</a>
             <a href="#" onclick="showSection('products'); return false;" class="menu-link text-end">📦 Produkter & Biljetter</a>
             <a href="#" onclick="showSection('customers-section'); return false;" class="menu-link text-end">⚙️ Kunder och Inställningar</a>
-            <a href="#" onclick="showSection('vip-section'); return false;" class="menu-link text-end">🎁 VIP Inbjudan (Gratis Biljett)</a>
+            <a href="#" onclick="showSection('guests-section'); return false;" class="menu-link text-end">🎟️ Inbjudna Gäster & VIP</a>
             <a href="#" onclick="showSection('transfers-section'); return false;" class="menu-link text-end">🔄 Överföringsbegäran</a>
             <a href="#" onclick="showSection('scanner-section'); return false;" class="menu-link text-end">📱 Ticket Scanner</a>
             <a href="#" onclick="showSection('checkin-report-section'); return false;" class="menu-link text-end">⏲ Real-Time Check-in</a>
@@ -3088,6 +3341,119 @@ ADMIN_DASHBOARD_TEMPLATE = """
                     <div class="card p-4 shadow-sm bg-white h-100">
                         <h5>Intäktsfördelning</h5>
                         <canvas id="pieChart" height="200"></canvas>
+                    </div>
+                </div>
+            </div>
+        </section>
+        
+        <!-- SECTION LIVE STREAMING MULTI-PLATEFORMES & STATISTIQUES -->
+        <section id="live-section" class="admin-section card p-4 shadow-sm mb-5 border-dark rounded-4">
+            <div class="d-flex justify-content-between align-items-center mb-4">
+                <div>
+                    <h3 class="fw-bold mb-1">📡 Styrning av Live Streaming (Multi-plattform)</h3>
+                    <p class="text-muted small mb-0">Aktivera en eller flera plattformar samtidigt för din direktsändning.</p>
+                </div>
+            </div>
+        
+            <form action="/admin/update_live" method="POST" class="bg-light p-3 rounded-3 mb-4 border">
+                <div class="form-check form-switch mb-4">
+                    <input class="form-check-input" type="checkbox" role="switch" name="live_active" id="liveActiveSwitch" {% if global_live.active %}checked{% endif %}>
+                    <label class="form-check-label fw-bold fs-6 text-dark" for="liveActiveSwitch">🔴 Huvudbrytare: Aktivera Live-fönster på webbplatsen</label>
+                </div>
+        
+                <div class="mb-3">
+                    <label class="form-label small fw-bold">Live Titel</label>
+                    <input type="text" class="form-control form-control-sm" name="live_title" value="{{ global_live.title }}">
+                </div>
+        
+                <h6 class="fw-bold mt-4 mb-3">Välj aktiva plattformar & ange inbäddningslänkar:</h6>
+        
+                <div class="row g-3">
+                    <!-- YOUTUBE -->
+                    <div class="col-md-6">
+                        <div class="p-3 border rounded bg-white shadow-sm">
+                            <div class="form-check mb-2">
+                                <input class="form-check-input" type="checkbox" name="active_youtube" id="checkYt" {% if global_live.platforms.youtube.active %}checked{% endif %}>
+                                <label class="form-check-label fw-bold text-danger" for="checkYt">YouTube Live</label>
+                            </div>
+                            <input type="text" class="form-control form-control-sm" name="url_youtube" value="{{ global_live.platforms.youtube.url }}" placeholder="https://www.youtube.com/embed/...">
+                        </div>
+                    </div>
+        
+                    <!-- FACEBOOK -->
+                    <div class="col-md-6">
+                        <div class="p-3 border rounded bg-white shadow-sm">
+                            <div class="form-check mb-2">
+                                <input class="form-check-input" type="checkbox" name="active_facebook" id="checkFb" {% if global_live.platforms.facebook.active %}checked{% endif %}>
+                                <label class="form-check-label fw-bold text-primary" for="checkFb">Facebook Live</label>
+                            </div>
+                            <input type="text" class="form-control form-control-sm" name="url_facebook" value="{{ global_live.platforms.facebook.url }}" placeholder="https://www.facebook.com/plugins/video.php?href=...">
+                        </div>
+                    </div>
+        
+                    <!-- TIKTOK -->
+                    <div class="col-md-6">
+                        <div class="p-3 border rounded bg-white shadow-sm">
+                            <div class="form-check mb-2">
+                                <input class="form-check-input" type="checkbox" name="active_tiktok" id="checkTt" {% if global_live.platforms.tiktok.active %}checked{% endif %}>
+                                <label class="form-check-label fw-bold text-dark" for="checkTt">TikTok Live</label>
+                            </div>
+                            <input type="text" class="form-control form-control-sm" name="url_tiktok" value="{{ global_live.platforms.tiktok.url }}" placeholder="https://www.tiktok.com/embed/v2/...">
+                        </div>
+                    </div>
+        
+                    <!-- INSTAGRAM -->
+                    <div class="col-md-6">
+                        <div class="p-3 border rounded bg-white shadow-sm">
+                            <div class="form-check mb-2">
+                                <input class="form-check-input" type="checkbox" name="active_instagram" id="checkIg" {% if global_live.platforms.instagram.active %}checked{% endif %}>
+                                <label class="form-check-label fw-bold text-secondary" for="checkIg">Instagram Live</label>
+                            </div>
+                            <input type="text" class="form-control form-control-sm" name="url_instagram" value="{{ global_live.platforms.instagram.url }}" placeholder="https://www.instagram.com/p/.../embed">
+                        </div>
+                    </div>
+                </div>
+        
+                <div class="text-end mt-4">
+                    <button type="submit" class="btn btn-dark btn-sm px-4 fw-bold">💾 Spara & Uppdatera Live Stream</button>
+                </div>
+            </form>
+        
+            <!-- STATISTIQUES DE PROVENANCE EN TEMPS RÉEL -->
+            <div class="mt-4 pt-3 border-top">
+                <div class="d-flex justify-content-between align-items-center mb-3">
+                    <h5 class="fw-bold fs-6 mb-0">📊 Trafikanalys per plattform (Visningar i realtid)</h5>
+                    <button type="button" class="btn btn-outline-dark btn-sm fw-bold" onclick="fetchLiveAnalytics()">🔄 Uppdatera statistik</button>
+                </div>
+        
+                <div class="row text-center g-3">
+                    <div class="col-md-3">
+                        <div class="p-3 border rounded bg-white shadow-sm">
+                            <small class="text-muted d-block fw-bold">YouTube</small>
+                            <strong class="fs-3 text-danger" id="statYoutube">0</strong>
+                            <span class="d-block text-muted small mt-1">visningar</span>
+                        </div>
+                    </div>
+                    <div class="col-md-3">
+                        <div class="p-3 border rounded bg-white shadow-sm">
+                            <small class="text-muted d-block fw-bold">Facebook</small>
+                            <strong class="fs-3 text-primary" id="statFacebook">0</strong>
+                            <span class="d-block text-muted small mt-1">visningar</span>
+                        </div>
+                    </div>
+                    <div class="col-md-3">
+                        <div class="p-3 border rounded bg-white shadow-sm">
+                            <small class="text-muted d-block fw-bold">TikTok</small>
+                            <strong class="fs-3 text-dark" id="statTiktok">0</strong>
+                            <span class="d-block text-muted small mt-1">visningar</span>
+                        </div>
+                    </div>
+                    <div class="col-md-3">
+                        <div class="p-3 border rounded bg-white shadow-sm">
+                            <small class="text-muted d-block fw-bold">Instagram</small>
+                            <strong class="fs-3 text-secondary" id="statInstagram">0</strong>
+                            <span class="d-block text-muted small mt-1">visningar</span>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -3489,36 +3855,109 @@ ADMIN_DASHBOARD_TEMPLATE = """
             </div>
         </section>
 
-        <!-- SECTION 8: VIP INBJUDAN -->
-        <section id="vip-section" class="admin-section card p-4 shadow-sm mb-5 border-dark">
-            <div class="d-flex justify-content-between align-items-center mb-3">
+        <!-- SECTION 8: GESTION DES INVITÉS & VIP -->
+        <section id="guests-section" class="admin-section card p-4 shadow-sm mb-5 border-dark rounded-4">
+            <div class="d-flex justify-content-between align-items-center mb-4 flex-wrap gap-2">
                 <div>
-                    <h3 class="mb-0">🎁 Utfärda VIP Inbjudan (Gratis Biljett)</h3>
-                    <p class="text-muted small mb-0">Biljetten placeras direkt i gästens konto på webbplatsen för att driva trafik till shoppen.</p>
+                    <h3 class="fw-bold mb-1">🎟️ Hantering av Inbjudna Gäster & VIP</h3>
+                    <p class="text-muted small mb-0">Utfärda gratis VIP-biljetter, skicka inbjudningar och följ närvaron i realtid (med 48h arkiv).</p>
+                </div>
+                <div class="d-flex gap-2">
+                    <a href="/admin?archive=true#guests-section" class="btn btn-outline-dark btn-sm fw-bold">📂 Visa Alla Arkiv</a>
+                    <a href="/admin#guests-section" class="btn btn-dark btn-sm fw-bold">⏱️ Senaste 48h</a>
                 </div>
             </div>
 
-            <form action="/admin/issue_vip_ticket" method="POST" class="row g-3 align-items-end">
-                <div class="col-md-3">
-                    <label class="form-label small fw-bold">Gästens Namn</label>
-                    <input type="text" class="form-control" name="guest_name" required placeholder="t.ex. Alex Lindqvist">
-                </div>
-                <div class="col-md-3">
-                    <label class="form-label small fw-bold">E-postadress</label>
-                    <input type="email" class="form-control" name="guest_email" required placeholder="alex@example.com">
-                </div>
-                <div class="col-md-3">
-                    <label class="form-label small fw-bold">Välj Evenemang</label>
-                    <select class="form-select" name="event_name">
-                        {% for e in events %}
-                        <option value="{{ e.title }}">{{ e.title }}</option>
-                        {% endfor %}
-                    </select>
-                </div>
-                <div class="col-md-3">
-                    <button type="submit" class="btn btn-dark w-100 fw-bold">🚀 Skicka VIP-inbjudan</button>
-                </div>
-            </form>
+            <div class="bg-light p-3 rounded-3 mb-4 border">
+                <h5 class="fw-bold fs-6 mb-3">➕ Utfärda ny VIP-inbjudan</h5>
+                <form action="/admin/add_guest" method="POST">
+                    <div class="row g-3">
+                        <div class="col-md-4">
+                            <label class="form-label small fw-bold">Fullständiga namn</label>
+                            <input type="text" class="form-control form-control-sm" name="guest_name" placeholder="Anna Svensson" required>
+                        </div>
+                        <div class="col-md-4">
+                            <label class="form-label small fw-bold">E-postadress</label>
+                            <input type="email" class="form-control form-control-sm" name="guest_email" placeholder="anna@example.com" required>
+                        </div>
+                        <div class="col-md-4">
+                            <label class="form-label small fw-bold">Välj Evenemang (Inbjudan)</label>
+                            <div class="border rounded p-2 bg-white" style="max-height: 100px; overflow-y: auto;">
+                                {% for event in events %}
+                                <div class="form-check form-check-inline d-block">
+                                    <input class="form-check-input" type="checkbox" name="guest_events" value="{{ event.title }}" id="evt_{{ loop.index }}">
+                                    <label class="form-check-label small" for="evt_{{ loop.index }}">{{ event.title }}</label>
+                                </div>
+                                {% endfor %}
+                            </div>
+                        </div>
+                    </div>
+                    <div class="text-end mt-3">
+                        <button type="submit" class="btn btn-dark btn-sm px-4 fw-bold">Spara & Lägg till i listan</button>
+                    </div>
+                </form>
+            </div>
+
+            <div class="table-responsive">
+                <table class="table table-hover align-middle">
+                    <thead class="table-dark" style="font-size: 0.85rem;">
+                        <tr>
+                            <th>Namn / E-post</th>
+                            <th>Inbjudna Evenemang</th>
+                            <th>Inbjudansstatus</th>
+                            <th>Närvaro (Scanner)</th>
+                            <th class="text-end">Åtgärder</th>
+                        </tr>
+                    </thead>
+                    <tbody style="font-size: 0.9rem;">
+                        {% if guests %}
+                            {% for guest in guests %}
+                            <tr>
+                                <td>
+                                    <strong class="d-block">{{ guest.name }}</strong>
+                                    <span class="text-muted small">{{ guest.email }}</span>
+                                </td>
+                                <td>
+                                    {% if guest.events_invited %}
+                                        {% for evt in guest.events_invited %}
+                                            <span class="badge bg-secondary mb-1">{{ evt }}</span>
+                                        {% endfor %}
+                                    {% else %}
+                                        <span class="text-muted small">Inga evenemang valda</span>
+                                    {% endif %}
+                                </td>
+                                <td>
+                                    {% if guest.invitation_sent %}
+                                        <span class="badge bg-success">✉️ Skickad</span>
+                                    {% else %}
+                                        <span class="badge bg-warning text-dark">⏳ Ej skickad</span>
+                                    {% endif %}
+                                </td>
+                                <td>
+                                    {% if guest.checked_in %}
+                                        <span class="badge bg-success px-2 py-1">🟢 På plats ({{ guest.checkin_time }})</span>
+                                    {% else %}
+                                        <span class="badge bg-secondary px-2 py-1">🔴 Ej anländ</span>
+                                    {% endif %}
+                                </td>
+                                <td class="text-end">
+                                    <div class="d-flex justify-content-end gap-1">
+                                        {% if not guest.invitation_sent %}
+                                        <a href="/admin/send_invitation/{{ guest.id }}" class="btn btn-dark btn-sm">Skicka</a>
+                                        {% endif %}
+                                        <a href="/admin/archive_guest/{{ guest.id }}" class="btn btn-outline-secondary btn-sm">
+                                            {% if guest.archived %}Återställ{% else %}Arkivera{% endif %}
+                                        </a>
+                                    </div>
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        {% else %}
+                            <tr><td colspan="5" class="text-center text-muted py-4">Inga gäster registrerade ännu.</td></tr>
+                        {% endif %}
+                    </tbody>
+                </table>
+            </div>
         </section>
 
         <!-- SECTION 9: ÖVERFÖRINGSBEGÄRAN -->
@@ -3954,6 +4393,39 @@ ADMIN_DASHBOARD_TEMPLATE = """
             closeNav();
         }
     
+        // --- GESTION DES ARCHIVES & OUVERTURE AUTOMATIQUE DE LA SECTION INVITÉS ---
+        function loadGuestsArchive(showAll) {
+            // Redirige vers la route avec le paramètre d'archive tout en forçant l'ancrage sur la section
+            window.location.href = "/admin?archive=" + showAll + "#guests-section";
+        }
+    
+        window.addEventListener('DOMContentLoaded', (event) => {
+            if (window.location.hash === '#guests-section') {
+                showSection('guests-section');
+            } else if (window.location.hash === '#live-section') {
+                showSection('live-section');
+            }
+        });
+        // -------------------------------------------------------------------------
+    
+        // --- ANALYTICS LIVE STREAMING EN TEMPS RÉEL ---
+        function fetchLiveAnalytics() {
+            fetch('/api/get_live_analytics')
+                .then(res => res.json())
+                .then(data => {
+                    if (document.getElementById('statYoutube')) document.getElementById('statYoutube').innerText = data.youtube || 0;
+                    if (document.getElementById('statFacebook')) document.getElementById('statFacebook').innerText = data.facebook || 0;
+                    if (document.getElementById('statTiktok')) document.getElementById('statTiktok').innerText = data.tiktok || 0;
+                    if (document.getElementById('statInstagram')) document.getElementById('statInstagram').innerText = data.instagram || 0;
+                })
+                .catch(err => console.error("Kunde inte hämta live-statistik:", err));
+        }
+    
+        // Lancer au chargement et rafraîchir automatiquement toutes les 10 secondes
+        fetchLiveAnalytics();
+        setInterval(fetchLiveAnalytics, 10000);
+        // ----------------------------------------------
+    
         function updateAdminClock() {
             const now = new Date();
             const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -4083,7 +4555,6 @@ ADMIN_DASHBOARD_TEMPLATE = """
         }
     
         fetchCheckinData();
-        // Rafraîchissement automatique toutes les 10 secondes au lieu de 3s (évite l'erreur 429)
         setInterval(fetchCheckinData, 10000);
     
         function exportFilteredCSV() {
