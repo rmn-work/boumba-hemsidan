@@ -14,11 +14,16 @@ import secrets
 import json
 import base64
 import warnings
-from reportlab.lib.pagesizes import A6
+from reportlab.lib.pagesizes import A6, letter
 from reportlab.lib import colors
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from werkzeug.security import generate_password_hash, check_password_hash
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.application import MIMEApplication
+
 
 app = Flask(__name__)
 app.config.update(
@@ -1063,23 +1068,6 @@ def admin_update_order(order_id):
     return redirect(url_for('admin_dashboard') + '#orders')
 
 
-@app.route('/request_return/<int:order_id>', methods=['POST'])
-def request_return(order_id):
-    current_user = get_current_user()
-    if not current_user: return redirect(url_for('user_login'))
-    reason = request.form.get('reason')
-    item_name = request.form.get('item_name')
-    order = next((o for o in ORDERS if o['id'] == order_id), None)
-    if order:
-        ret_id = max([r['id'] for r in RETURNS]) + 1 if RETURNS else 101
-        RETURNS.append({
-            "id": ret_id, "order_id": order_id, "customer_email": current_user['email'],
-            "reason": reason, "item_name": item_name, "amount": order['total'], "status": "Under behandling"
-        })
-        flash("Din returbegäran har skickats till kundtjänst!", "success")
-    return redirect(url_for('user_account'))
-
-
 @app.route('/admin/return/process/<int:return_id>/<string:action>')
 def admin_process_return(return_id, action):
     if not session.get('admin_logged'): return redirect(url_for('admin_login'))
@@ -1278,6 +1266,10 @@ def admin_dashboard():
         p['sold'] * (p['discount_price'] if p.get('discount_price') else p['price']) for p in PRODUCTS if
         p['type'] == 'ticket')
     pending_transfers = getattr(app, 'PENDING_TRANSFERS', [])
+
+    product_names = [p.get('name') for p in PRODUCTS]
+    product_stocks = [p.get('total_stock', 0) for p in PRODUCTS]
+    product_sold = [p.get('sold', 0) for p in PRODUCTS]
 
     return render_template_string(ADMIN_DASHBOARD_TEMPLATE,
                                   products=PRODUCTS,
@@ -1887,6 +1879,372 @@ def track_live_view():
 
     return jsonify({"status": "error", "message": "Plattform hittades inte"}), 400
 
+
+PASSWORD_RESET_TOKENS = {}
+
+
+@app.route('/forgot-password', methods=['GET', 'POST'])
+def forgot_password():
+    if request.method == 'POST':
+        email = request.form.get('email', '').strip().lower()
+        # Rechercher le client par son e-mail
+        user = next((c for c in CUSTOMERS if c.get('email', '').lower() == email), None)
+
+        if user:
+            # Générer un token unique sécurisé
+            token = secrets.token_urlsafe(32)
+            PASSWORD_RESET_TOKENS[token] = email
+
+            # En production, envoyez un vrai e-mail. Ici, on simule l'affichage du lien de réinitialisation.
+            reset_link = url_for('reset_password', token=token, _external=True)
+            flash(f"Un e-mail de réinitialisation a été simulé. Lien : {reset_link}", "success")
+        else:
+            flash("Aucun compte associé à cet e-mail n'a été trouvé.", "danger")
+
+        return redirect(url_for('forgot_password'))
+
+    return render_template_string(FORGOT_PASSWORD_TEMPLATE)
+
+
+@app.route('/reset-password/<token>', methods=['GET', 'POST'])
+def reset_password(token):
+    if token not in PASSWORD_RESET_TOKENS:
+        flash("Ce lien de réinitialisation est invalide ou a expiré.", "danger")
+        return redirect(url_for('index'))
+
+    if request.method == 'POST':
+        new_password = request.form.get('new_password')
+        email = PASSWORD_RESET_TOKENS[token]
+
+        # Mettre à jour le mot de passe du client
+        for c in CUSTOMERS:
+            if c.get('email', '').lower() == email.lower():
+                c[
+                    'password'] = new_password  # Pensez à hasher le mot de passe avec werkzeug.security si vous l'utilisez
+                break
+
+        # Supprimer le token après utilisation
+        del PASSWORD_RESET_TOKENS[token]
+        flash("Votre mot de passe a été mis à jour avec succès. Vous pouvez vous connecter.", "success")
+        return redirect(url_for('index'))
+
+    return render_template_string(RESET_PASSWORD_TEMPLATE, token=token)
+
+
+@app.route('/change-password', methods=['POST'])
+def change_password():
+    if not session.get('user_logged'):
+        flash("Veuillez vous connecter pour modifier votre mot de passe.", "danger")
+        return redirect(url_for('index'))
+
+    user_email = session.get('user_email')
+    current_password = request.form.get('current_password')
+    new_password = request.form.get('new_password')
+
+    user = next((c for c in CUSTOMERS if c.get('email', '').lower() == user_email.lower()), None)
+
+    if user and user.get('password') == current_password:
+        user['password'] = new_password
+        flash("Votre mot de passe a été modifié avec succès.", "success")
+    else:
+        flash("Le mot de passe actuel est incorrect.", "danger")
+
+    return redirect(url_for('index') + '#profile-section')
+
+
+def generate_invoice_pdf(order, customer_info):
+    """Génère un PDF professionnel conforme aux normes suédoises (Skatteverket) avec TVA."""
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
+    story = []
+    styles = getSampleStyleSheet()
+
+    # En-tête / Titre
+    title_style = ParagraphStyle('InvoiceTitle', parent=styles['Heading1'], fontSize=20, leading=24,
+                                 textColor=colors.HexColor('#111111'))
+    story.append(Paragraph(f"FAKTURA / B2B INVOICE - #{order['id']}", title_style))
+    story.append(Spacer(1, 10))
+
+    # Calculs financiers (TVA de 25% par défaut en Suède)
+    total_inc_vat = float(order.get('total', 0))
+    vat_rate = 0.25
+    total_ex_vat = total_inc_vat / (1 + vat_rate)
+    vat_amount = total_inc_vat - total_ex_vat
+
+    # Informations Vendeur (URBAN NATION) & Acheteur (Entreprise partenaire)
+    seller_info = """
+    <b>Säljare (Sändare):</b> URBAN NATION Sweden AB<br/>
+    <b>Org.nr:</b> 556999-1234 | <b>Momsreg.nr:</b> SE556999123401<br/>
+    <b>E-post:</b> fakturering@urbannation.se<br/>
+    """
+
+    buyer_info = f"""
+    <b>Köpare (Mottagare):</b> {customer_info.get('name', '')}<br/>
+    <b>Org.nr / VAT:</b> {customer_info.get('org_number', 'Ej angivet')}<br/>
+    <b>E-post:</b> {customer_info.get('email', '')}<br/>
+    <b>Adress:</b> {customer_info.get('address', 'B2B Partner')}
+    """
+
+    header_table_data = [[Paragraph(seller_info, styles['Normal']), Paragraph(buyer_info, styles['Normal'])]]
+    header_table = Table(header_table_data, colWidths=[270, 270])
+    header_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#f8f9fa')),
+        ('PADDING', (0, 0), (-1, -1), 10),
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e9ecef'))
+    ]))
+
+    story.append(header_table)
+    story.append(Spacer(1, 15))
+
+    # Détails de la facture
+    meta_text = f"""
+    <b>Fakturadatum:</b> {order.get('date', '')}<br/>
+    <b>Förfallodagar:</b> 30 dagar netto<br/>
+    <b>Betalningsvillkor:</b> Bankgiro 123-4567
+    """
+    story.append(Paragraph(meta_text, styles['Normal']))
+    story.append(Spacer(1, 15))
+
+    # Tableau des articles
+    data = [["Artikel / Beskrivning", "Antal", "Pris exkl. moms", "Moms (25%)", "Totalt inkl. moms"]]
+    for item in order.get('order_items', []):
+        item_price = float(item.get('price', 0))
+        item_ex = item_price / 1.25
+        item_vat = item_price - item_ex
+        data.append(
+            [item.get('name', 'Produkt'), "1", f"{item_ex:.2f} SEK", f"{item_vat:.2f} SEK", f"{item_price:.2f} SEK"])
+
+    table = Table(data, colWidths=[180, 50, 100, 90, 120])
+    table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#212529')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 9),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 6),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#dddddd')),
+    ]))
+
+    story.append(table)
+    story.append(Spacer(1, 15))
+
+    # Bloc Totaux (Exkl. moms, moms, Total att betala)
+    totals_data = [
+        ["Summa exkl. moms:", f"{total_ex_vat:.2f} SEK"],
+        ["Moms (25%):", f"{vat_amount:.2f} SEK"],
+        ["Att betala inkl. moms:", f"{total_inc_vat:.2f} SEK"]
+    ]
+    totals_table = Table(totals_data, colWidths=[400, 140])
+    totals_table.setStyle(TableStyle([
+        ('ALIGN', (0, 0), (-1, -1), 'RIGHT'),
+        ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 10),
+        ('BACKGROUND', (0, -1), (-1, -1), colors.HexColor('#f8f9fa')),
+        ('LINEABOVE', (0, -1), (-1, -1), 1, colors.HexColor('#212529')),
+    ]))
+
+    story.append(totals_table)
+    story.append(Spacer(1, 25))
+    story.append(Paragraph("Tack för ert samarbete! Godkänd för F-skatt.", styles['Italic']))
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer
+
+
+SMTP_SERVER = "smtp.gmail.com"
+SMTP_PORT = 587
+SMTP_USER = "support@urbannation.se"
+SMTP_PASSWORD = "votre_mot_de_passe_app"
+
+def send_notification_email(to_email, subject, body_html, pdf_attachment=None, pdf_filename="facture.pdf"):
+    """Envoie un e-mail au client avec support HTML et pièce jointe PDF facultative."""
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = f"URBAN NATION <{SMTP_USER}>"
+        msg['To'] = to_email
+        msg['Subject'] = subject
+
+        msg.attach(MIMEText(body_html, 'html'))
+
+        if pdf_attachment:
+            part = MIMEApplication(pdf_attachment.read(), _subtype="pdf")
+            part.add_header('Content-Disposition', 'attachment', filename=pdf_filename)
+            msg.attach(part)
+
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.send_message(msg)
+        return True
+    except Exception as e:
+        print(f"⚠️ Erreur lors de l'envoi de l'e-mail à {to_email}: {e}")
+        return False
+
+
+@app.route('/download_invoice/<int:order_id>')
+def download_invoice(order_id):
+    """Permet au client de télécharger sa facture depuis son espace 'Mitt Konto'."""
+    if not session.get('user_logged'):
+        return redirect('/login')
+
+    user_email = session.get('user_email')
+    customer = next((c for c in CUSTOMERS if c.get('email', '').lower() == user_email.lower()), {})
+    order = next((o for o in ORDERS if o.get('id') == order_id), None)
+
+    if not order:
+        flash("Ordern hittades inte.", "danger")
+        return redirect('/account')
+
+    pdf_buffer = generate_invoice_pdf(order, customer)
+    return send_file(pdf_buffer, as_attachment=True, download_name=f"Facture_URBAN_NATION_{order_id}.pdf", mimetype='application/pdf')
+
+
+def process_successful_order(order, customer_info):
+    """Appelé lors du paiement réussi : Génère la facture et l'envoie par mail."""
+    pdf_file = generate_invoice_pdf(order, customer_info)
+    subject = f"Orderbekräftelse & Faktura - Order #{order['id']} URBAN NATION"
+    body_html = f"""
+    <h2>Tack för din beställning, {customer_info.get('name')}!</h2>
+    <p>Vi har tagit emot din order <b>#{order['id']}</b> på <b>{order['total']} SEK</b>.</p>
+    <p>Din faktura och orderbekräftelse finns bifogad som PDF i detta e-postmeddelande.</p>
+    <br/>
+    <p>Med vänliga hälsningar,<br/><b>URBAN NATION Team</b></p>
+    """
+    send_notification_email(customer_info['email'], subject, body_html, pdf_attachment=pdf_file, pdf_filename=f"Faktura_Order_{order['id']}.pdf")
+
+
+@app.route('/request_return/<int:order_id>', methods=['POST'])
+def request_return(order_id):
+    current_user = get_current_user()
+    if not current_user:
+        return redirect(url_for('user_login'))
+
+    reason = request.form.get('reason')
+    item_name = request.form.get('item_name')
+    user_email = current_user.get('email')
+
+    order = next((o for o in ORDERS if o.get('id') == order_id), None)
+    if order:
+        ret_id = max([r['id'] for r in RETURNS]) + 1 if RETURNS else 101
+        RETURNS.append({
+            "id": ret_id,
+            "order_id": order_id,
+            "customer_email": user_email,
+            "reason": reason,
+            "item_name": item_name,
+            "amount": order.get('total', 0),
+            "status": "Under behandling"
+        })
+
+        order['return_requested'] = True
+        order['return_reason'] = reason
+
+        subject_client = f"Returbegäran Mottagen - Order #{order_id}"
+        html_client = f"""
+        <h3>Vi har tagit emot din returbegäran för Order #{order_id}</h3>
+        <p><b>Produkt:</b> {item_name}</p>
+        <p><b>Anledning:</b> {reason}</p>
+        <p>Vårt team granskar ditt ärende och återkommer med instruktioner och retursedel inom kort.</p>
+        """
+        send_notification_email(user_email, subject_client, html_client)
+
+        subject_admin = f"🚨 NY RETURBEGÄRAN: Order #{order_id}"
+        html_admin = f"""
+        <h3>Ny returbegäran från {user_email}</h3>
+        <p><b>Order ID:</b> #{order_id}</p>
+        <p><b>Produkt:</b> {item_name}</p>
+        <p><b>Orsak:</b> {reason}</p>
+        <p><a href="http://127.0.0.1:5000/admin#orders-section">Gå till Admin Dashboard för att hantera returen</a></p>
+        """
+        send_notification_email("admin@urbannation.se", subject_admin, html_admin)
+
+        flash("Din returbegäran har skickats till kundtjänst! En bekräftelse har skickats till din e-post.", "success")
+
+    return redirect(url_for('user_account'))
+
+
+@app.route('/admin/b2b_invoices', methods=['POST'])
+def admin_add_b2b_invoice():
+    if not session.get('admin_logged'):
+        return redirect(url_for('admin_login'))
+
+    company_name = request.form.get('company_name')
+    org_number = request.form.get('org_number')
+    email = request.form.get('email')
+    items_description = request.form.get('items_description')
+    amount = float(request.form.get('amount', 0))
+    date = request.form.get('date')
+
+    new_id = max([inv['id'] for inv in B2B_INVOICES]) + 1 if B2B_INVOICES else 501
+
+    invoice_data = {
+        "id": new_id,
+        "company_name": company_name,
+        "org_number": org_number,
+        "email": email,
+        "items_description": items_description,
+        "amount": amount,
+        "date": date,
+        "status": "Skickad / Obehandlad"
+    }
+    B2B_INVOICES.append(invoice_data)
+
+    try:
+        order_sim = {"id": new_id, "date": date, "total": amount,
+                     "order_items": [{"name": items_description, "price": amount}]}
+        customer_sim = {
+            "name": company_name,
+            "org_number": org_number,
+            "email": email,
+            "address": "B2B Partner",
+            "postal_code": "",
+            "city": ""
+        }
+
+        pdf_file = generate_invoice_pdf(order_sim, customer_sim)
+
+        subject = f"Faktura B2B #{new_id} - URBAN NATION Business"
+        body_html = f"""
+        <h3>Faktura från URBAN NATION</h3>
+        <p>Hej <b>{company_name}</b>,</p>
+        <p>Bifogat finner ni faktura <b>#{new_id}</b> på totalt <b>{amount} SEK</b> (inkl. moms).</p>
+        <p>Vänligen betala inom 30 dagar.</p>
+        """
+        send_notification_email(email, subject, body_html, pdf_attachment=pdf_file,
+                                pdf_filename=f"B2B_Faktura_{new_id}.pdf")
+    except Exception as e:
+        print(f"Erreur envoi B2B: {e}")
+
+    flash("B2B-faktura skapad och skickad till företaget!", "success")
+    return redirect(url_for('admin_dashboard') + '#b2b-section')
+
+
+@app.route('/admin/download_b2b_invoice/<int:inv_id>')
+def download_b2b_invoice(inv_id):
+    if not session.get('admin_logged'):
+        return redirect(url_for('admin_login'))
+
+    inv = next((i for i in B2B_INVOICES if i['id'] == inv_id), None)
+    if not inv:
+        flash("Fakturans hittades inte.", "danger")
+        return redirect(url_for('admin_dashboard'))
+
+    order_sim = {"id": inv['id'], "date": inv['date'], "total": inv['amount'],
+                 "order_items": [{"name": inv['items_description'], "price": inv['amount']}]}
+    customer_sim = {
+        "name": inv['company_name'],
+        "org_number": inv['org_number'],
+        "email": inv['email'],
+        "address": "B2B Partner",
+        "postal_code": "",
+        "city": ""
+    }
+
+    pdf_buffer = generate_invoice_pdf(order_sim, customer_sim)
+    return send_file(pdf_buffer, as_attachment=True, download_name=f"Faktura_B2B_{inv_id}.pdf",
+                     mimetype='application/pdf')
 
 # --- STYLES HARMONISÉS NOIR & BLANC (SANS JAUNE, TEXTES LISIBLES) ---
 
@@ -2596,6 +2954,9 @@ USER_LOGIN_TEMPLATE = """
                 <div class="mb-3">
                     <label class="form-label">Lösenord</label>
                     <input type="password" class="form-control" name="password" required placeholder="Ditt lösenord">
+                    <div class="text-end mt-1">
+                        <a href="/forgot-password" class="text-decoration-none small text-dark fw-semibold">Glömt ditt lösenord?</a>
+                    </div>
                 </div>
                 <button type="submit" class="btn btn-dark w-100 btn-lg">Logga in</button>
             </form>
@@ -2845,7 +3206,7 @@ USER_ACCOUNT_TEMPLATE = """
         {% endwith %}
 
         <div class="row">
-            <!-- Profil och ändring av personuppgifter -->
+            <!-- Profil, ändring av personuppgifter & lösenord -->
             <div class="col-md-4 mb-4">
                 <div class="card p-4 shadow-sm bg-white border-0">
                     <div class="text-center mb-3">
@@ -2869,6 +3230,22 @@ USER_ACCOUNT_TEMPLATE = """
                             <div class="col-6"><label class="form-label small">Stad</label><input type="text" class="form-control form-control-sm" id="cityInput" name="city" value="{{ current_user.city }}" required></div>
                         </div>
                         <button type="submit" class="btn btn-dark btn-sm w-100 mt-2">Spara uppdateringar</button>
+                    </form>
+                </div>
+
+                <!-- 🔒 FORMULAIRE DE MODIFICATION DU MOT DE PASSE -->
+                <div class="card p-4 shadow-sm mt-4 bg-white border-0">
+                    <h5 class="fw-bold mb-3">🔒 Ändra lösenord</h5>
+                    <form action="/change-password" method="POST">
+                        <div class="mb-3">
+                            <label class="form-label small fw-bold">Nuvarande lösenord</label>
+                            <input type="password" class="form-control form-control-sm" name="current_password" required>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label small fw-bold">Nytt lösenord</label>
+                            <input type="password" class="form-control form-control-sm" name="new_password" required>
+                        </div>
+                        <button type="submit" class="btn btn-dark btn-sm fw-bold w-100">Uppdatera lösenord</button>
                     </form>
                 </div>
             </div>
@@ -2958,10 +3335,17 @@ USER_ACCOUNT_TEMPLATE = """
                                 </div>
                             </div>
 
-                            <!-- Options de gestion : Retur -->
-                            {% if 'VIP' not in order.status and 'Mottagen' not in order.status %}
-                            <div class="d-flex gap-2">
-                                <button class="btn btn-outline-dark btn-sm" data-bs-toggle="collapse" data-bs-target="#returnForm{{ order.id }}">🔄 Begär Retur / Reklamation</button>
+                            <!-- Options de gestion : Téléchargement de Facture & Retur -->
+                            <div class="d-flex gap-2 mt-2 flex-wrap">
+                                <a href="/download_invoice/{{ order.id }}" class="btn btn-outline-dark btn-sm fw-bold">
+                                    📄 Ladda ner Faktura (PDF)
+                                </a>
+
+                                {% if 'VIP' not in order.status and 'Mottagen' not in order.status %}
+                                    <button class="btn btn-outline-danger btn-sm" data-bs-toggle="collapse" data-bs-target="#returnForm{{ order.id }}">
+                                        🔄 Begär Retur / Reklamation
+                                    </button>
+                                {% endif %}
                             </div>
 
                             <!-- Formulaire repliable de retour -->
@@ -2984,7 +3368,6 @@ USER_ACCOUNT_TEMPLATE = """
                                     <button type="submit" class="btn btn-dark btn-sm">Skicka Returbegäran</button>
                                 </form>
                             </div>
-                            {% endif %}
                         </div>
                         {% endfor %}
                     {% else %}
@@ -3201,6 +3584,7 @@ ADMIN_DASHBOARD_TEMPLATE = """
 
         <div class="admin-sidebar-content">
             <a href="#" onclick="showSection('stats'); return false;" class="menu-link active text-end">📊 Statistik</a>
+            <a href="#" onclick="showSection('b2b-section'); return false;" class="menu-link text-end">🏢 Fakturering</a>
             <a href="#" onclick="showSection('live-section'); return false;" class="menu-link text-end">📡 Styrning av Live Streaming</a>
             <a href="#" onclick="showSection('categories'); return false;" class="menu-link text-end">🏷️ Kategorier</a>
             <a href="#" onclick="showSection('orders'); return false;" class="menu-link text-end">🚚 Beställningar</a>
@@ -3333,7 +3717,7 @@ ADMIN_DASHBOARD_TEMPLATE = """
             <div class="row">
                 <div class="col-md-7 mb-3">
                     <div class="card p-4 shadow-sm bg-white h-100">
-                        <h5>Lagersituation: Inlagda vs Sålda</h5>
+                        <h5>Lagersituation: Inlagda vs Sålda (Dynamisk)</h5>
                         <canvas id="barChart" height="200"></canvas>
                     </div>
                 </div>
@@ -3345,6 +3729,96 @@ ADMIN_DASHBOARD_TEMPLATE = """
                 </div>
             </div>
         </section>
+        
+        <!-- SECTION B2B FAKTURERING -->
+        <section id="b2b-section" class="admin-section card p-4 shadow-sm mb-5">
+            <div class="d-flex justify-content-between align-items-center mb-4">
+                <h3 class="mb-0">🏢 B2B Fakturering & Företagssammarbeten</h3>
+                <button class="btn btn-dark btn-sm" data-bs-toggle="modal" data-bs-target="#newB2BModal">➕ Skapa ny B2B-faktura</button>
+            </div>
+        
+            <!-- Tableau des factures B2B existantes -->
+            <div class="table-scroll-container">
+                <table class="table table-striped align-middle mb-0">
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>Företag</th>
+                            <th>Org.nummer</th>
+                            <th>E-post</th>
+                            <th>Beskrivning</th>
+                            <th>Belopp</th>
+                            <th>Datum</th>
+                            <th>Status</th>
+                            <th>Åtgärd</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for inv in b2b_invoices %}
+                        <tr>
+                            <td>#{{ inv.id }}</td>
+                            <td><strong>{{ inv.company_name }}</strong></td>
+                            <td><code>{{ inv.org_number }}</code></td>
+                            <td>{{ inv.email }}</td>
+                            <td>{{ inv.items_description }}</td>
+                            <td><strong class="text-dark">{{ inv.amount }} SEK</strong></td>
+                            <td>{{ inv.date }}</td>
+                            <td><span class="badge bg-secondary">{{ inv.status }}</span></td>
+                            <td>
+                                <a href="/admin/download_b2b_invoice/{{ inv.id }}" class="btn btn-outline-dark btn-sm fw-bold">📄 PDF</a>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </section>
+        
+        <!-- MODALE DE CRÉATION DE FACTURE B2B -->
+        <div class="modal fade" id="newB2BModal" tabindex="-1">
+            <div class="modal-dialog">
+                <div class="modal-content">
+                    <form action="/admin/b2b_invoices" method="POST">
+                        <div class="modal-header">
+                            <h5 class="modal-title fw-bold">Skapa ny B2B-faktura</h5>
+                            <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                        </div>
+                        <div class="modal-body">
+                            <div class="mb-3">
+                                <label class="form-label small fw-bold">Företagsnamn</label>
+                                <input type="text" class="form-control" name="company_name" required placeholder="Ex: Nordic Fashion AB">
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label small fw-bold">Organisationsnummer</label>
+                                <input type="text" class="form-control" name="org_number" required placeholder="556XXX-XXXX">
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label small fw-bold">Företagets E-post</label>
+                                <input type="email" class="form-control" name="email" required placeholder="faktura@foretag.se">
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label small fw-bold">Beskrivning av varor / tjänster</label>
+                                <textarea class="form-control" name="items_description" rows="2" required placeholder="Parti-leverans..."></textarea>
+                            </div>
+                            <div class="row">
+                                <div class="col-md-6 mb-3">
+                                    <label class="form-label small fw-bold">Belopp (SEK)</label>
+                                    <input type="number" class="form-control" name="amount" required placeholder="15000">
+                                </div>
+                                <div class="col-md-6 mb-3">
+                                    <label class="form-label small fw-bold">Fakturadatum</label>
+                                    <input type="date" class="form-control" name="date" required value="2026-10-26">
+                                </div>
+                            </div>
+                        </div>
+                        <div class="modal-footer">
+                            <button type="button" class="btn btn-outline-secondary btn-sm" data-bs-dismiss="modal">Avbryt</button>
+                            <button type="submit" class="btn btn-dark btn-sm">Skicka Faktura 🚀</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </div>
         
         <!-- SECTION LIVE STREAMING MULTI-PLATEFORMES & STATISTIQUES -->
         <section id="live-section" class="admin-section card p-4 shadow-sm mb-5 border-dark rounded-4">
@@ -3805,22 +4279,22 @@ ADMIN_DASHBOARD_TEMPLATE = """
                         </div>
                         <div class="col-md-3"><label class="form-label">Lagerantal (Stock)</label><input type="number" class="form-control" name="total_stock" value="50" required></div>
                     </div>
-
+        
                     <div class="row mb-3">
                         <div class="col-md-4"><label class="form-label">Storlekar (Komma-separerade)</label><input type="text" class="form-control" name="sizes" placeholder="S, M, L, XL,..."></div>
                         <div class="col-md-4"><label class="form-label">Färger (Komma-separerade)</label><input type="text" class="form-control" name="colors" placeholder="Svart, Vit"></div>
                         <div class="col-md-4"><label class="form-label">📁 Ladda upp bildfil</label><input type="file" class="form-control" name="image_file" accept="image/*"></div>
                     </div>
-
+        
                     <div class="row mb-3">
                         <div class="col-md-12"><label class="form-label">🔗 Eller Bild-URL</label><input type="text" class="form-control" name="image_url" placeholder="https://..."></div>
                     </div>
-
+        
                     <div class="mb-3"><label class="form-label">Beskrivning</label><textarea class="form-control" name="desc" rows="2" placeholder="Kort beskrivning..."></textarea></div>
                     <button type="submit" class="btn btn-dark">Lägg till produkt / Biljett</button>
                 </form>
             </div>
-
+        
             <div class="card p-4 shadow-sm">
                 <h3 class="mb-3">Befintliga Produkter</h3>
                 <div class="table-scroll-container">
@@ -4364,6 +4838,7 @@ ADMIN_DASHBOARD_TEMPLATE = """
     </div>
 
     <script src="https://unpkg.com/@zxing/library@latest"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script>
         function openNav() {
             document.getElementById("adminSidebar").style.width = "280px";
@@ -4447,18 +4922,55 @@ ADMIN_DASHBOARD_TEMPLATE = """
         setInterval(updateAdminClock, 1000);
         updateAdminClock();
     
-        const ctxBar = document.getElementById('barChart').getContext('2d');
-        new Chart(ctxBar, {
-            type: 'bar',
-            data: {
-                labels: [{% for p in products %}"{{ p.name }}",{% endfor %}],
-                datasets: [
-                    { label: 'Totalt Inlagda (Stock)', data: [{% for p in products %}{{ p.total_stock }},{% endfor %}], backgroundColor: '#0d6efd' },
-                    { label: 'Sålda', data: [{% for p in products %}{{ p.sold }},{% endfor %}], backgroundColor: '#198754' }
-                ]
-            },
-            options: { responsive: true, scales: { y: { beginAtZero: true } } }
+        // --- GRAPHIQUE DYNAMIQUE DES PRODUITS (BARCHART) ---
+        document.addEventListener("DOMContentLoaded", function () {
+            // Récupération dynamique des données produits transmises par Flask
+            const productLabels = {{ products | map(attribute='name') | list | tojson }};
+            const productStocks = {{ products | map(attribute='total_stock') | list | tojson }};
+            const productSold = {{ products | map(attribute='sold') | list | tojson }};
+    
+            // Fonction pour générer des couleurs uniques et automatiques pour chaque produit
+            function generateColors(count) {
+                let bgColors = [];
+                for (let i = 0; i < count; i++) {
+                    let hue = (i * 137.5) % 360; // Distribution harmonieuse des couleurs
+                    bgColors.push(`hsl(${hue}, 70%, 55%)`);
+                }
+                return bgColors;
+            }
+    
+            const dynamicColors = generateColors(productLabels.length);
+    
+            // 1. Graphique en barres (Lagersituation: Inlagda vs Sålda)
+            const ctxBar = document.getElementById('barChart').getContext('2d');
+            new Chart(ctxBar, {
+                type: 'bar',
+                data: {
+                    labels: productLabels,
+                    datasets: [
+                        {
+                            label: 'Totalt Lager (Inlagda)',
+                            data: productStocks,
+                            backgroundColor: '#212529', // Noir/Dark standard Urban Nation
+                            borderRadius: 4
+                        },
+                        {
+                            label: 'Sålda',
+                            data: productSold,
+                            backgroundColor: dynamicColors, // Couleurs propres et automatiques par produit
+                            borderRadius: 4
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    scales: {
+                        y: { beginAtZero: true }
+                    }
+                }
+            });
         });
+        // ----------------------------------------------------
     
         const ctxPie = document.getElementById('pieChart').getContext('2d');
         new Chart(ctxPie, {
@@ -5114,6 +5626,71 @@ SALES_REPORT_PDF_TEMPLATE = """
 </body>
 </html>
 """
+
+FORGOT_PASSWORD_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+    <meta charset="UTF-8">
+    <title>Glömt lösenord - URBAN NATION</title>
+    """ + COMMON_STYLES + """
+</head>
+<body class="bg-light">
+    <div class="container my-5" style="max-width: 450px;">
+        <div class="text-center mb-4">
+            <img src="{{ logo_url }}" alt="Urban Nation Logo" style="height: 80px; width: 80px; border-radius: 50%; object-fit: cover;" class="mb-2 shadow-sm" onerror="this.style.display='none'">
+            <h2 class="fw-bold text-uppercase">URBAN <span style="color: #000;">NATION</span></h2>
+        </div>
+        <div class="card p-4 shadow-sm">
+            <h4 class="mb-3 text-center fw-bold">Återställ lösenord</h4>
+            <p class="text-muted small text-center mb-4">Ange din e-postadress så skickar vi instruktioner för att återställa ditt lösenord.</p>
+
+            {% with messages = get_flashed_messages(with_categories=true) %}
+              {% if messages %}{% for c, m in messages %}<div class="alert alert-{{ c }} small py-2">{{ m }}</div>{% endfor %}{% endif %}
+            {% endwith %}
+
+            <form method="POST">
+                <div class="mb-3">
+                    <label class="form-label">E-postadress</label>
+                    <input type="email" class="form-control" name="email" required placeholder="namn@example.se">
+                </div>
+                <button type="submit" class="btn btn-dark w-100 btn-lg">Skicka återställningslänk</button>
+            </form>
+
+            <hr class="my-4">
+            <div class="text-center">
+                <a href="/login" class="btn btn-link text-decoration-none text-dark p-0">&larr; Tillbaka till inloggning</a>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+RESET_PASSWORD_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+    <meta charset="UTF-8">
+    <title>Nytt lösenord - URBAN NATION</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body class="bg-dark text-white d-flex align-items-center justify-content-center vh-100">
+    <div class="card p-4 shadow-lg bg-black border border-warning rounded-4" style="width: 400px;">
+        <h3 class="fw-bold text-center mb-3 text-warning">Skapa nytt lösenord</h3>
+
+        <form method="POST">
+            <div class="mb-3">
+                <label class="form-label small fw-bold">Nytt lösenord</label>
+                <input type="password" class="form-control form-control-sm bg-dark text-white border-secondary" name="new_password" required>
+            </div>
+            <button type="submit" class="btn btn-warning w-100 fw-bold btn-sm py-2">Spara nytt lösenord</button>
+        </form>
+    </div>
+</body>
+</html>
+"""
+
 
 if __name__ == '__main__':
     app.run(debug=True)
